@@ -1,0 +1,9 @@
+{
+  "name": "flma",
+  "version": "0.1.0",
+  "title": "Factorio Live MCP Agent",
+  "author": "jhjaggars",
+  "description": "Exports live game state (tech tree, production stats, logistics networks, player inventories, placed buildings) as JSON/NDJSON under script-output for a local MCP bridge to consume. Designed to be near-zero cost when disabled and cheap when enabled: no on_tick polling, engine-aggregated reads over full scans, and an incrementally-maintained building index instead of periodic full scans.",
+  "factorio_version": "2.0",
+  "dependencies": ["base >= 2.0.0"]
+}

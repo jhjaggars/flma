@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+.nox/
+
+# uv
+.venv/
+
+# Mod packaging output
+*.zip
+
+# IDE
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,8 @@
+---------------------------------------------------------------------------------------------------
+Version: 0.1.0
+Date: 2026-07-01
+  Features:
+    - Initial release. Exports tech tree, production statistics, logistics
+      network contents, player inventories (opt-in), and an incrementally
+      maintained placed-building index to script-output/flma/ for the
+      factorio-live-mcp local bridge.

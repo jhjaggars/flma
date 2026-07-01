@@ -1,4 +1,23 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.2.0
+Date: 2026-07-01
+  Changes:
+    - Buildings tracking now also excludes belts/undergrounds/splitters/
+      loaders, pipes (incl. underground/infinity/heat), electric poles,
+      inserters, and all rail/rail-signal variants from positional tracking —
+      still a blocklist by Factorio's built-in entity `type`, so this covers
+      any mod's custom variants of these (including pyanodons') without
+      per-mod maintenance. These are extremely high-cardinality on any real
+      base and were making the baseline scan, the in-memory index, and
+      compaction all scale far worse than needed.
+    - The baseline scan's collecting phase now iterates Factorio's own map
+      chunk grid (32x32 tiles) instead of one find_entities_filtered call per
+      surface, bounding each tick's cost by chunk density rather than total
+      base size — a megabase just takes more ticks, never a bigger spike.
+    - Added a remote interface for debugging without a fresh save:
+      remote.call("flma", "status") and remote.call("flma",
+      "reset_buildings") (mod-local storage isn't readable from /c commands).
+---------------------------------------------------------------------------------------------------
 Version: 0.1.1
 Date: 2026-07-01
   Bugfixes:

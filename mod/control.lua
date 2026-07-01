@@ -21,9 +21,13 @@
 
 local OUTPUT_DIR = "flma"
 
--- Entity types we don't consider a "placed building" for query_buildings —
--- resources, trees, fish, etc. are not something a player placed.
+-- Entity types we don't consider a "placed building" for query_buildings.
+-- This is a blocklist by Factorio's built-in prototype `type`, not by name —
+-- every mod's custom entities (including all of pyanodons') still have to
+-- declare one of these fixed engine type categories, so this generalizes to
+-- any mod without per-mod maintenance. Two groups:
 local BUILDING_TYPE_BLOCKLIST = {
+  -- not player-placed at all
   ["resource"] = true,
   ["tree"] = true,
   ["fish"] = true,
@@ -41,6 +45,36 @@ local BUILDING_TYPE_BLOCKLIST = {
   ["highlight-box"] = true,
   ["flying-text"] = true,
   ["speech-bubble"] = true,
+  -- player-placed, but high-cardinality "connective tissue" rather than
+  -- production/logistics structures — on any real base (let alone a
+  -- pyanodons-scale one) these vastly outnumber actual buildings and aren't
+  -- useful to track positionally for query_buildings.
+  ["transport-belt"] = true,
+  ["underground-belt"] = true,
+  ["splitter"] = true,
+  ["linked-belt"] = true,
+  ["loader"] = true,
+  ["loader-1x1"] = true,
+  ["pipe"] = true,
+  ["pipe-to-ground"] = true,
+  ["infinity-pipe"] = true,
+  ["heat-pipe"] = true,
+  ["electric-pole"] = true,
+  ["inserter"] = true,
+  ["straight-rail"] = true,
+  ["curved-rail-a"] = true,
+  ["curved-rail-b"] = true,
+  ["half-diagonal-rail"] = true,
+  ["legacy-straight-rail"] = true,
+  ["legacy-curved-rail"] = true,
+  ["elevated-straight-rail"] = true,
+  ["elevated-curved-rail-a"] = true,
+  ["elevated-curved-rail-b"] = true,
+  ["elevated-half-diagonal-rail"] = true,
+  ["rail-ramp"] = true,
+  ["rail-support"] = true,
+  ["rail-signal"] = true,
+  ["rail-chain-signal"] = true,
 }
 
 -- Same set as a flat array, for passing to find_entities_filtered{type=..,
@@ -55,10 +89,16 @@ local NON_BUILDING_TYPES = (function()
   return t
 end)()
 
--- Number of entities to scan per tick while building the initial baseline —
--- keeps the one unavoidable full scan from spiking a single frame even on a
+-- Number of entities to apply to the in-memory index per tick while draining
+-- the baseline scan queue — keeps that from spiking a single frame even on a
 -- huge base. Tuned conservatively; adjust after profiling with show-time-usage.
 local BASELINE_CHUNK_SIZE = 500
+
+-- Number of Factorio map chunks (32x32 tiles each) to query per tick while
+-- collecting the baseline scan's candidate entities. Bounds each tick's
+-- find_entities_filtered cost by chunk density, not total base size — a
+-- megabase just takes more ticks overall, never a bigger single-tick spike.
+local BASELINE_CHUNKS_PER_TICK = 5
 
 --------------------------------------------------------------------------------
 -- settings helpers
@@ -325,44 +365,55 @@ end
 
 -- Time-sliced baseline scan, in two phases so nothing does O(#entities) or
 -- O(#buildings) work in a single tick:
---   1. Collecting: one surface's worth of candidate entities per tick, using
---      find_entities_filtered{type=NON_BUILDING_TYPES, invert=true} so the
---      engine excludes resources/trees/etc. natively — the previous version
---      passed an empty filter, which materializes *every* entity on the
---      surface (every resource tile, every tree) before Lua-side filtering,
---      and did all surfaces synchronously in one call. On a large, fully
---      explored map that was the actual freeze.
+--   1. Collecting: BASELINE_CHUNKS_PER_TICK map chunks' worth of candidate
+--      entities per tick, using find_entities_filtered{area=chunk.area,
+--      type=NON_BUILDING_TYPES, invert=true} so the engine excludes
+--      resources/trees/belts/pipes/etc. natively and each call is bounded by
+--      one chunk's entity density — not by surface size or total base size.
+--      Earlier versions called find_entities_filtered once per *surface*
+--      (or, worse, with no filter at all), which is exactly the O(#entities)
+--      full-map operation this design is supposed to avoid.
 --   2. Draining: BASELINE_CHUNK_SIZE entities applied to the in-memory index
 --      per tick, written with one batched append_lines_batch call per tick
 --      instead of one write_file syscall per entity.
 local function start_baseline_scan()
-  local surfaces_queue = {}
+  local chunks_queue = {}
   for _, surface in pairs(game.surfaces) do
-    surfaces_queue[#surfaces_queue + 1] = surface
+    for chunk in surface.get_chunks() do
+      chunks_queue[#chunks_queue + 1] = { surface = surface, area = chunk.area }
+    end
   end
-  storage.flma.baseline_surfaces = surfaces_queue
-  storage.flma.baseline_surface_index = 1
+  storage.flma.baseline_chunks = chunks_queue
+  storage.flma.baseline_chunk_index = 1
   storage.flma.baseline_entities = {}
   storage.flma.baseline_entity_index = 1
   storage.flma.baseline_collecting = true
 
   script.on_event(defines.events.on_tick, function()
     if storage.flma.baseline_collecting then
-      local si = storage.flma.baseline_surface_index
-      local surfaces = storage.flma.baseline_surfaces
-      if si > #surfaces then
+      local chunks = storage.flma.baseline_chunks
+      local ci = storage.flma.baseline_chunk_index
+      if ci > #chunks then
         storage.flma.baseline_collecting = false
-        storage.flma.baseline_surfaces = nil
+        storage.flma.baseline_chunks = nil
         return
       end
-      local found = surfaces[si].find_entities_filtered({ type = NON_BUILDING_TYPES, invert = true })
+      local last = math.min(ci + BASELINE_CHUNKS_PER_TICK - 1, #chunks)
       local entities = storage.flma.baseline_entities
-      for _, entity in pairs(found) do
-        if entity.unit_number then
-          entities[#entities + 1] = entity
+      for k = ci, last do
+        local c = chunks[k]
+        local found = c.surface.find_entities_filtered({
+          area = c.area,
+          type = NON_BUILDING_TYPES,
+          invert = true,
+        })
+        for _, entity in pairs(found) do
+          if entity.unit_number then
+            entities[#entities + 1] = entity
+          end
         end
       end
-      storage.flma.baseline_surface_index = si + 1
+      storage.flma.baseline_chunk_index = last + 1
       return
     end
 
@@ -496,3 +547,41 @@ script.on_event(defines.events.on_runtime_mod_setting_changed, function(event)
     end
   end
 end)
+
+--------------------------------------------------------------------------------
+-- remote interface — for debugging from the console. Mod-local `storage` is
+-- not readable from a /c command (those run in the scenario's own separate
+-- storage scope), so this is the only way to inspect or reset flma's state
+-- without editing settings or starting a fresh save.
+--   /c remote.call("flma", "status")
+--   /c remote.call("flma", "reset_buildings")
+--------------------------------------------------------------------------------
+
+remote.add_interface("flma", {
+  status = function()
+    local initialized = storage.flma and storage.flma.buildings_initialized or false
+    local count = 0
+    if storage.flma and storage.flma.buildings then
+      for _ in pairs(storage.flma.buildings) do
+        count = count + 1
+      end
+    end
+    game.print(string.format(
+      "flma: export_enabled=%s buildings_enabled=%s buildings_initialized=%s tracked_buildings=%d lines_since_compact=%d",
+      tostring(export_enabled()),
+      tostring(buildings_enabled()),
+      tostring(initialized),
+      count,
+      storage.flma and storage.flma.building_lines_since_compact or 0
+    ))
+  end,
+  reset_buildings = function()
+    ensure_storage()
+    storage.flma.buildings = {}
+    storage.flma.buildings_initialized = false
+    storage.flma.building_lines_since_compact = 0
+    helpers.write_file(OUTPUT_DIR .. "/buildings.ndjson", "", false) -- truncate
+    game.print("flma: building index reset; re-scanning under current rules")
+    reschedule()
+  end,
+})

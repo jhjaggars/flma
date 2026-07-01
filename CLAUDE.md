@@ -51,13 +51,37 @@ throughout (see its top-of-file comment for the full rationale):
    snapshots each cycle (cheap, no diffing needed).
 3. Buildings are the one dataset proportional to base size. Instead of a scheduled
    `find_entities_filtered{}` scan, `flma` maintains an incremental index: one
-   time-sliced baseline scan (`BASELINE_CHUNK_SIZE` entities/tick) the first time
-   it's enabled, then O(1) per build/mine event via filtered event handlers. The
-   event log (`buildings.ndjson`) is periodically compacted from the in-memory
-   index rather than re-scanned.
+   time-sliced baseline scan the first time it's enabled, then O(1) per build/mine
+   event via filtered event handlers. The event log (`buildings.ndjson`) is
+   periodically compacted from the in-memory index rather than re-scanned.
+   - "Buildings" is a **blocklist by Factorio's built-in prototype `type`**, not by
+     name — this is what makes it mod-agnostic: every mod's custom entities
+     (including all of pyanodons') still have to declare one of the engine's fixed
+     type categories, so a blocklist of types covers any mod's variants
+     automatically. Besides non-placed entities (resources, trees, corpses, etc.),
+     it also excludes high-cardinality "connective tissue" types — belts, pipes,
+     poles, inserters, rails/signals — since those vastly outnumber actual
+     production/logistics structures on any real base and aren't useful to track
+     positionally.
+   - The baseline scan's collecting phase iterates Factorio's own map chunk grid
+     (32x32 tiles, via `surface.get_chunks()`), `BASELINE_CHUNKS_PER_TICK` chunks
+     per tick, each queried with `find_entities_filtered{area=.., type=..,
+     invert=true}` so the engine excludes non-buildings natively. This bounds each
+     tick's cost by chunk density, not total base size — a megabase just takes
+     more ticks, never a bigger single-tick spike. The draining phase then applies
+     `BASELINE_CHUNK_SIZE` entities/tick to the in-memory index, and both the
+     baseline dump and periodic compaction write in one batched `write_file` call
+     rather than one syscall per building.
 4. Everything is gated behind the synced `flma-export-enabled` runtime-global
    setting — disabled means zero registered handlers (verified via F4
    `show-time-usage`), not just an early-return inside a live handler.
+
+**Debugging note:** mod-local `storage` is not readable from `/c` console commands
+(those execute in the scenario's own separate storage scope, not the mod's) — use
+the remote interface instead: `/c remote.call("flma", "status")` prints export
+state and tracked-building count; `/c remote.call("flma", "reset_buildings")` clears
+the index and forces a fresh baseline scan under current rules, without needing a
+new save.
 
 ## Mod settings (Mod settings → Map, or `/c settings.global[...] = {value=...}`)
 

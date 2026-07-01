@@ -43,6 +43,18 @@ local BUILDING_TYPE_BLOCKLIST = {
   ["speech-bubble"] = true,
 }
 
+-- Same set as a flat array, for passing to find_entities_filtered{type=..,
+-- invert=true} so the engine excludes these natively instead of every entity
+-- (including every resource tile and tree on the map) being materialized as a
+-- Lua object just to get thrown away by is_building() below.
+local NON_BUILDING_TYPES = (function()
+  local t = {}
+  for name, _ in pairs(BUILDING_TYPE_BLOCKLIST) do
+    t[#t + 1] = name
+  end
+  return t
+end)()
+
 -- Number of entities to scan per tick while building the initial baseline —
 -- keeps the one unavoidable full scan from spiking a single frame even on a
 -- huge base. Tuned conservatively; adjust after profiling with show-time-usage.
@@ -88,6 +100,21 @@ end
 
 local function append_line(name, data)
   helpers.write_file(OUTPUT_DIR .. "/" .. name .. ".ndjson", helpers.table_to_json(data) .. "\n", true)
+end
+
+-- Same as append_line but for many records in one call — one write_file
+-- syscall instead of one per record. Used anywhere a batch of building
+-- records needs writing at once (baseline scan draining, compaction), since
+-- doing that one line at a time is its own O(#buildings)-syscalls cost.
+local function append_lines_batch(name, records, append)
+  if #records == 0 then
+    return
+  end
+  local lines = {}
+  for i, data in ipairs(records) do
+    lines[i] = helpers.table_to_json(data)
+  end
+  helpers.write_file(OUTPUT_DIR .. "/" .. name .. ".ndjson", table.concat(lines, "\n") .. "\n", append)
 end
 
 --------------------------------------------------------------------------------
@@ -240,14 +267,24 @@ local function building_record(entity)
   }
 end
 
-local function record_build(entity)
+-- Updates the in-memory index only — no disk write. Returns the record on
+-- success so callers can decide how to persist it (single append_line for a
+-- live build event, or batched for the baseline scan).
+local function apply_build(entity)
   if not is_building(entity) or not entity.unit_number then
-    return
+    return nil
   end
   local rec = building_record(entity)
   storage.flma.buildings[rec.id] = rec
   storage.flma.building_lines_since_compact = storage.flma.building_lines_since_compact + 1
-  append_line("buildings", { t = game.tick, op = "add", entity = rec })
+  return rec
+end
+
+local function record_build(entity)
+  local rec = apply_build(entity)
+  if rec then
+    append_line("buildings", { t = game.tick, op = "add", entity = rec })
+  end
 end
 
 local function record_remove(entity)
@@ -266,12 +303,17 @@ end
 -- authoritative and cheap to hold — one small table entry per building).
 -- This is O(#buildings) but runs rarely (only once every
 -- flma-buildings-compact-threshold appended lines), not on a fixed schedule,
--- so cost scales with churn, not with wall-clock time.
+-- so cost scales with churn, not with wall-clock time. Written as a single
+-- batched write (not one append_line call per building) — on a large base
+-- the difference is one write_file syscall vs. tens of thousands of them in
+-- the same tick.
 local function compact_buildings()
-  helpers.write_file(OUTPUT_DIR .. "/buildings.ndjson", "", false) -- truncate
+  local records = {}
   for _, rec in pairs(storage.flma.buildings) do
-    append_line("buildings", { t = game.tick, op = "add", entity = rec })
+    records[#records + 1] = { t = game.tick, op = "add", entity = rec }
   end
+  helpers.write_file(OUTPUT_DIR .. "/buildings.ndjson", "", false) -- truncate
+  append_lines_batch("buildings", records, true)
   storage.flma.building_lines_since_compact = 0
 end
 
@@ -281,35 +323,66 @@ local function maybe_compact_buildings()
   end
 end
 
--- Time-sliced baseline scan: collect all matching entities up front (cheap,
--- just references) and drain BASELINE_CHUNK_SIZE of them per tick via a
--- temporary on_tick handler, so a huge base doesn't spike one frame. Uses
--- on_tick only for the duration of this one-time scan, then unregisters
--- itself — not a standing per-tick cost.
+-- Time-sliced baseline scan, in two phases so nothing does O(#entities) or
+-- O(#buildings) work in a single tick:
+--   1. Collecting: one surface's worth of candidate entities per tick, using
+--      find_entities_filtered{type=NON_BUILDING_TYPES, invert=true} so the
+--      engine excludes resources/trees/etc. natively — the previous version
+--      passed an empty filter, which materializes *every* entity on the
+--      surface (every resource tile, every tree) before Lua-side filtering,
+--      and did all surfaces synchronously in one call. On a large, fully
+--      explored map that was the actual freeze.
+--   2. Draining: BASELINE_CHUNK_SIZE entities applied to the in-memory index
+--      per tick, written with one batched append_lines_batch call per tick
+--      instead of one write_file syscall per entity.
 local function start_baseline_scan()
-  local queue = {}
+  local surfaces_queue = {}
   for _, surface in pairs(game.surfaces) do
-    for _, entity in pairs(surface.find_entities_filtered({})) do
-      if is_building(entity) and entity.unit_number then
-        queue[#queue + 1] = entity
-      end
-    end
+    surfaces_queue[#surfaces_queue + 1] = surface
   end
-  storage.flma.baseline_queue = queue
-  storage.flma.baseline_index = 1
+  storage.flma.baseline_surfaces = surfaces_queue
+  storage.flma.baseline_surface_index = 1
+  storage.flma.baseline_entities = {}
+  storage.flma.baseline_entity_index = 1
+  storage.flma.baseline_collecting = true
 
   script.on_event(defines.events.on_tick, function()
-    local q = storage.flma.baseline_queue
-    local i = storage.flma.baseline_index
-    local last = math.min(i + BASELINE_CHUNK_SIZE - 1, #q)
-    for j = i, last do
-      record_build(q[j])
+    if storage.flma.baseline_collecting then
+      local si = storage.flma.baseline_surface_index
+      local surfaces = storage.flma.baseline_surfaces
+      if si > #surfaces then
+        storage.flma.baseline_collecting = false
+        storage.flma.baseline_surfaces = nil
+        return
+      end
+      local found = surfaces[si].find_entities_filtered({ type = NON_BUILDING_TYPES, invert = true })
+      local entities = storage.flma.baseline_entities
+      for _, entity in pairs(found) do
+        if entity.unit_number then
+          entities[#entities + 1] = entity
+        end
+      end
+      storage.flma.baseline_surface_index = si + 1
+      return
     end
-    storage.flma.baseline_index = last + 1
-    if storage.flma.baseline_index > #q then
+
+    local entities = storage.flma.baseline_entities
+    local i = storage.flma.baseline_entity_index
+    local last = math.min(i + BASELINE_CHUNK_SIZE - 1, #entities)
+    local batch = {}
+    for j = i, last do
+      local rec = apply_build(entities[j])
+      if rec then
+        batch[#batch + 1] = { t = game.tick, op = "add", entity = rec }
+      end
+    end
+    append_lines_batch("buildings", batch, true)
+    storage.flma.baseline_entity_index = last + 1
+    if storage.flma.baseline_entity_index > #entities then
       script.on_event(defines.events.on_tick, nil) -- unregister: baseline done
-      storage.flma.baseline_queue = nil
+      storage.flma.baseline_entities = nil
       storage.flma.buildings_initialized = true
+      maybe_compact_buildings() -- fold the baseline dump into one compacted write
     end
   end)
 end
@@ -344,6 +417,7 @@ local DESTROY_EVENTS = {
 
 local function on_build_event(event)
   record_build(event.entity)
+  maybe_compact_buildings()
 end
 
 local function on_destroy_event(event)

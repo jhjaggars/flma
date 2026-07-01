@@ -1,4 +1,25 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.1.1
+Date: 2026-07-01
+  Bugfixes:
+    - tech.json was overwritten once per force (player/enemy/neutral all shared
+      the same file), so only the last-iterated force's data survived. Now
+      nested per-force like production.json/logistics.json.
+    - The buildings baseline scan used an unfiltered find_entities_filtered{},
+      which materializes every entity on a surface (every resource tile,
+      every tree) before Lua-side filtering, done synchronously per surface.
+      On a large, fully explored save this froze the game. Now uses a native
+      type=/invert= filter so the engine excludes non-buildings up front, and
+      the surface scan itself is time-sliced across ticks.
+    - Baseline-scan draining and buildings.ndjson compaction wrote one line
+      per building via a separate write_file call each (tens of thousands of
+      syscalls in a single tick on a large base). Both now batch into one
+      write per tick/compaction.
+    - Compaction previously only checked after destroy events, so a large
+      build spree (including the baseline scan itself) could grow
+      buildings.ndjson far past flma-buildings-compact-threshold before ever
+      compacting. Build events now check too.
+---------------------------------------------------------------------------------------------------
 Version: 0.1.0
 Date: 2026-07-01
   Features:

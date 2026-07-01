@@ -225,8 +225,13 @@ local function export_production_stats()
   for force_name, force in pairs(game.forces) do
     local surfaces_out = {}
     for _, surface in pairs(game.surfaces) do
-      local ok_items, item_stats = pcall(force.get_item_production_statistics, force, surface)
-      local ok_fluids, fluid_stats = pcall(force.get_fluid_production_statistics, force, surface)
+      -- force.method (dot-access on a live instance) is already bound to that
+      -- instance, so re-passing `force` as an explicit self argument shifts
+      -- `surface` out of position — the engine then sees `force` where it
+      -- expects a SurfaceIdentification and rejects it. Pass only the real
+      -- argument.
+      local ok_items, item_stats = pcall(force.get_item_production_statistics, surface)
+      local ok_fluids, fluid_stats = pcall(force.get_fluid_production_statistics, surface)
       surfaces_out[surface.name] = {
         items = ok_items and flow_to_table(item_stats) or nil,
         fluids = ok_fluids and flow_to_table(fluid_stats) or nil,
@@ -583,5 +588,17 @@ remote.add_interface("flma", {
     helpers.write_file(OUTPUT_DIR .. "/buildings.ndjson", "", false) -- truncate
     game.print("flma: building index reset; re-scanning under current rules")
     reschedule()
+  end,
+  -- Forces one export cycle immediately, without waiting for the next
+  -- on_nth_tick — useful when the server has no connected players (ticks
+  -- don't advance, so the schedule never fires) or when debugging.
+  export_now = function()
+    export_production_stats()
+    export_logistics()
+    if inventories_enabled() then
+      export_inventories()
+    end
+    export_all_forces_tech()
+    game.print("flma: forced an export cycle")
   end,
 })

@@ -1,4 +1,22 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.2.1
+Date: 2026-07-01
+  Bugfixes:
+    - production.json has been silently empty (items/fluids always nil) since
+      the mod was first written. force.get_item_production_statistics and
+      get_fluid_production_statistics were called as pcall(force.method,
+      force, surface) — but dot-access on a live LuaForce instance already
+      returns a bound closure, so re-passing force as an explicit self
+      argument shifted the real `surface` argument out of position. Fixed to
+      pcall(force.method, surface). Found and confirmed via RCON, which let
+      us test the exact call directly against a running game instead of
+      guessing from the bridge's Python-side tests (which only ever exercised
+      hand-written fixture JSON, never the actual Lua export).
+  Additions:
+    - remote.call("flma", "export_now") forces one export cycle immediately
+      — useful when the server has no connected players (ticks don't
+      advance, so on_nth_tick never fires) or for on-demand debugging.
+---------------------------------------------------------------------------------------------------
 Version: 0.2.0
 Date: 2026-07-01
   Changes:

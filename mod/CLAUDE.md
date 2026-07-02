@@ -1,0 +1,124 @@
+# mod/ — the flma Factorio mod (the producer)
+
+A Factorio 2.0 mod that exports live game state as JSON/NDJSON under
+`script-output/flma/`. Lua only, self-contained — nothing in here imports or
+depends on the Python side; the exported files (documented in `../SCHEMA.md`)
+are the entire interface.
+
+Runs as part of the synced mod set on the server *and* every client (it has a
+control stage, so its checksum must match — it cannot be a client-only mod).
+Every peer writes its own local copy; there is no `for_player` filtering.
+
+## Efficiency — the core design constraint
+
+Because this code runs on the server for every player, not just the one running
+the bridge, per-tick cost is shared by everyone. `control.lua` follows these
+rules throughout (see its top-of-file comment for the full rationale):
+
+1. No `on_tick` hook — only `script.on_nth_tick(N)` with a large, configurable `N`
+   (`flma-tick-interval`, default 300 ticks / ~5s).
+2. Tech/production/logistics/inventories use engine-aggregated reads
+   (`LuaFlowStatistics`, `LuaLogisticNetwork:get_contents()`, force-level tables) —
+   cost is O(#item types), not O(#entities) — and are overwritten as small full
+   snapshots each cycle (cheap, no diffing needed).
+3. Buildings are the one dataset proportional to base size. Instead of a scheduled
+   `find_entities_filtered{}` scan, `flma` maintains an incremental index: one
+   time-sliced baseline scan the first time it's enabled, then O(1) per build/mine
+   event via filtered event handlers. The event log (`buildings.ndjson`) is
+   periodically compacted from the in-memory index rather than re-scanned.
+   - "Buildings" is a **blocklist by Factorio's built-in prototype `type`**, not by
+     name — this is what makes it mod-agnostic: every mod's custom entities
+     (including all of pyanodons') still have to declare one of the engine's fixed
+     type categories, so a blocklist of types covers any mod's variants
+     automatically. Besides non-placed entities (resources, trees, corpses, etc.),
+     it also excludes high-cardinality "connective tissue" types — belts, pipes,
+     poles, inserters, rails/signals — since those vastly outnumber actual
+     production/logistics structures on any real base and aren't useful to track
+     positionally. Mobile `unit`s and everything on the `enemy`/`neutral` forces
+     (nests, worms, remnants) are excluded too — nothing non-factory is tracked.
+   - The baseline scan's collecting phase iterates Factorio's own map chunk grid
+     (32x32 tiles, via `surface.get_chunks()`), `BASELINE_CHUNKS_PER_TICK` chunks
+     per tick, each queried with `find_entities_filtered{area=.., type=..,
+     invert=true}` so the engine excludes non-buildings natively. This bounds each
+     tick's cost by chunk density, not total base size — a megabase just takes
+     more ticks, never a bigger single-tick spike. The draining phase then applies
+     `BASELINE_CHUNK_SIZE` entities/tick to the in-memory index, and both the
+     baseline dump and periodic compaction write in one batched `write_file` call
+     rather than one syscall per building.
+4. Everything is gated behind the synced `flma-export-enabled` runtime-global
+   setting — disabled means zero registered handlers (verified via F4
+   `show-time-usage`), not just an early-return inside a live handler.
+
+## Settings (Mod settings → Map, or `/c settings.global[...] = {value=...}`)
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `flma-export-enabled` | `false` | Master switch — gates every handler registration |
+| `flma-tick-interval` | `300` | Ticks between production/logistics/inventory exports |
+| `flma-export-inventories` | `false` | Player inventory contents are more sensitive than aggregate stats |
+| `flma-export-buildings` | `false` | Triggers the one-time baseline scan; off by default |
+| `flma-buildings-compact-threshold` | `20000` | Lines appended before `buildings.ndjson` is compacted |
+
+## Files written (`script-output/flma/`)
+
+Summary only — **`../SCHEMA.md` is the authoritative format reference** (exact
+JSON shapes with real examples, the empty-array-as-`{}` quirk, quality-tiered
+contents arrays vs. plain count maps, torn-write handling, compaction detection).
+Any change to what this mod writes must be reflected there and noted in
+`changelog.txt`.
+
+| File | Written | Contents |
+|---|---|---|
+| `tech.json` | on research started/finished/queued/cancelled/reversed events (full overwrite) | per-force: current research, progress, queue, all technologies + prerequisites |
+| `research.json` | every `flma-tick-interval` (full overwrite) | per-force: current research, progress, queue only (O(#forces), not the full tech table) — keeps `research_progress` live between the coarser research events that refresh `tech.json` |
+| `production.json` | every `flma-tick-interval` (full overwrite) | per-force, per-surface item/fluid `input_counts`/`output_counts` (lifetime cumulative totals) **and** `input_rates_per_min`/`output_rates_per_min` (real per-minute flow, via `get_flow_count`) |
+| `logistics.json` | every `flma-tick-interval` (full overwrite) | per-force logistic networks: contents, robot counts |
+| `inventories.json` | every `flma-tick-interval`, if enabled (full overwrite) | connected players' main inventory contents |
+| `buildings.ndjson` | on build/mine events (append), periodically compacted | `{"op":"add"/"remove", "entity":{...}}` event log |
+
+## Debugging
+
+Mod-local `storage` is not readable from `/c` console commands (those execute in
+the scenario's own separate storage scope, not the mod's) — use the remote
+interface instead: `/c remote.call("flma", "status")` prints export state and
+tracked-building count; `/c remote.call("flma", "reset_buildings")` clears the
+index and forces a fresh baseline scan under current rules, without needing a
+new save; `/c remote.call("flma", "export_now")` forces one export cycle
+immediately (useful when no players are connected and ticks aren't advancing).
+
+For iterating against a live game, use the local dev environment in `../dev/`
+(see `.claude/skills/factorio-dev/SKILL.md`) — note a **version bump in
+`info.json` requires fully restarting both server and client**, not just a save
+reload.
+
+## Packaging
+
+From the repo root: `make mod-zip` → `flma_<version>.zip`; drop into
+`~/.factorio/mods/` or upload to the mod portal.
+
+## Verifying in-game
+
+Confirmed working against a real running client (mod checksum loads clean, settings
+toggle live via `on_runtime_mod_setting_changed`, all 8 MCP tools return real data
+from a live save):
+
+1. Copy `mod/` into `~/.factorio/mods/flma_<version>/` (or `make mod-zip` and use the
+   in-game mod manager), enable it, start/load a save.
+2. Enable the map setting `flma-export-enabled` (Mod settings → Map). Confirm
+   `script-output/flma/tech.json` appears with a non-empty `forces.player` entry.
+3. Research a technology; confirm `tech.json` updates without waiting a full
+   `flma-tick-interval`.
+4. Run the bridge (`make run` with `SCRIPT_OUTPUT_DIR` pointed at that
+   `script-output/flma`) and exercise each tool via the MCP inspector or a client;
+   confirm `get_snapshot_age` tracks the live game.
+5. Enable `flma-export-buildings`; confirm `buildings.ndjson` gets a burst of `add`
+   events (the baseline scan) spread across a few ticks, not one frame spike.
+   ✅ Verified 2026-07: a 26,195-building base wrote its baseline across ~59 ticks.
+
+Still open (not yet exercised against a real base with construction happening):
+
+6. Build/mine something with `flma-export-buildings` on; confirm exactly one
+   `add`/`remove` line appears per event (the live log so far contains only the
+   baseline burst — zero live events, zero removes).
+7. Check cost: F4 → `show-time-usage`, toggle `flma-export-enabled` off/on and
+   confirm the mod's line drops to ~0 when disabled.

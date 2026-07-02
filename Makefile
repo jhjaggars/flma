@@ -53,6 +53,7 @@ mod-zip: ## Zip the flma mod for local install (~/.factorio/mods) or the mod por
 	@VERSION=$$(python3 -c "import json; print(json.load(open('mod/info.json'))['version'])"); \
 	rm -rf /tmp/flma_$$VERSION flma_$$VERSION.zip; \
 	cp -r mod /tmp/flma_$$VERSION; \
+	rm -f /tmp/flma_$$VERSION/CLAUDE.md; \
 	(cd /tmp && zip -rq "$(CURDIR)/flma_$$VERSION.zip" "flma_$$VERSION"); \
 	rm -rf /tmp/flma_$$VERSION; \
 	echo "Built flma_$$VERSION.zip"

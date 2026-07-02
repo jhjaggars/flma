@@ -62,7 +62,8 @@ throughout (see its top-of-file comment for the full rationale):
      it also excludes high-cardinality "connective tissue" types — belts, pipes,
      poles, inserters, rails/signals — since those vastly outnumber actual
      production/logistics structures on any real base and aren't useful to track
-     positionally.
+     positionally. Mobile `unit`s and everything on the `enemy`/`neutral` forces
+     (nests, worms, remnants) are excluded too — nothing non-factory is tracked.
    - The baseline scan's collecting phase iterates Factorio's own map chunk grid
      (32x32 tiles, via `surface.get_chunks()`), `BASELINE_CHUNKS_PER_TICK` chunks
      per tick, each queried with `find_entities_filtered{area=.., type=..,
@@ -97,8 +98,9 @@ new save.
 
 | File | Written | Contents |
 |---|---|---|
-| `tech.json` | on research events (full overwrite) | per-force: current research, progress, queue, all technologies + prerequisites |
-| `production.json` | every `flma-tick-interval` (full overwrite) | per-force, per-surface item/fluid input/output counts |
+| `tech.json` | on research started/finished/queued/cancelled/reversed events (full overwrite) | per-force: current research, progress, queue, all technologies + prerequisites |
+| `research.json` | every `flma-tick-interval` (full overwrite) | per-force: current research, progress, queue only (O(#forces), not the full tech table) — keeps `research_progress` live between the coarser research events that refresh `tech.json` |
+| `production.json` | every `flma-tick-interval` (full overwrite) | per-force, per-surface item/fluid `input_counts`/`output_counts` (lifetime cumulative totals) **and** `input_rates_per_min`/`output_rates_per_min` (real per-minute flow, via `get_flow_count`) |
 | `logistics.json` | every `flma-tick-interval` (full overwrite) | per-force logistic networks: contents, robot counts |
 | `inventories.json` | every `flma-tick-interval`, if enabled (full overwrite) | connected players' main inventory contents |
 | `buildings.ndjson` | on build/mine events (append), periodically compacted | `{"op":"add"/"remove", "entity":{...}}` event log |
@@ -107,20 +109,59 @@ new save.
 
 | Tool | Purpose |
 |---|---|
-| `get_research_status` | Current research, progress, queue |
+| `get_research_status` | Current research, progress, queue (prefers the live `research.json`, falls back to `tech.json`) |
 | `get_tech_tree` | Researched / available / locked technologies |
-| `get_production_stats` | Item/fluid input & output rates |
+| `get_production_stats` | Item/fluid cumulative totals and per-minute rates |
 | `get_logistics` | Logistic network contents and robot counts |
 | `get_player_inventory` | A connected player's main inventory |
 | `get_building_counts` | Placed-building counts by name/type |
 | `query_buildings` | Filter placed buildings by name/type/surface/force, with positions |
-| `get_snapshot_age` | Staleness (seconds) of each feed — sanity-check the mod is running |
+| `get_snapshot_age` | Staleness (seconds) of each feed (including `buildings` and `research`) — sanity-check the mod is running |
 
 `src/game_state.py` owns the file-reading model: `SnapshotFile` re-reads a full JSON
 snapshot only when its mtime/size changes; `BuildingIndex` tails `buildings.ndjson`
-by byte offset and detects mod-side compaction (file shrinks → replay from scratch).
-`GameState.refresh()` throttles disk hits to `MIN_REFRESH_INTERVAL_SECONDS`
-regardless of tool-call burstiness.
+by byte offset and detects mod-side compaction both by size shrinking and by a
+leading-bytes fingerprint (catches a same-or-larger-size rewrite too), replaying
+from scratch when either fires. `GameState.refresh()` throttles disk hits to
+`MIN_REFRESH_INTERVAL_SECONDS` regardless of tool-call burstiness, and holds a
+coarse lock across its whole body so concurrent MCP tool calls (dispatched via
+`asyncio.to_thread`) can't race on `BuildingIndex`'s byte offset.
+
+## Factory planner (`planner/`)
+
+A local CLI — **no MCP server, no Hermes** — that answers "how do I build a
+production line for X at rate Y, and what am I already producing toward it?"
+by combining this repo's live game state with `recipe-mcp`'s static
+recipe/machine data (`~/code/homelab/apps/recipe-mcp`, a sibling project —
+its `recipes.json` is a dump from the **RecipeExporter** Factorio mod).
+
+The heavy arithmetic (recipe-chain expansion, batches → machine counts,
+raw-input rollup) is **not reimplemented here** — it's recipe-mcp's own
+`engine.plan_product`/`engine._expand_node` (extracted from its MCP-tool
+`server.py` into a plain, FastMCP-independent `engine.py` specifically so
+both the MCP server and this CLI call the identical, already-tested code).
+`planner/` only adds what didn't exist anywhere: live-production netting,
+buffered-logistics-stock lookup, tech-scoping from the live save, and belt/pipe
+count constants (recipes.json has no throughput data at all).
+
+```bash
+uv run python -m planner status                          # health check (also the no-arg default)
+uv run python -m planner plan "processing unit" --rate 10 # rate is items/sec by default
+uv run python -m planner have iron-plate                  # what am I already producing/storing?
+```
+
+Config: `RECIPE_MCP_DIR` (default `~/code/homelab/apps/recipe-mcp`),
+`RECIPES_DB` (default `$RECIPE_MCP_DIR/recipes.db` — build once via
+`cd $RECIPE_MCP_DIR && make build-db`). Reuses this repo's own
+`SCRIPT_OUTPUT_DIR` for live state.
+
+**Modpack alignment matters.** The committed recipe dump is a **Pyanodons**
+game; this machine's live save may be running a different modpack (Space Age,
+confirmed, at time of writing) — in which case live tech-scoping and
+production-netting correctly report "no match" rather than silently mixing
+data across incompatible games. See `.claude/skills/factory-planner/SKILL.md`
+for the full workflow guide and caveats (recipe-selection quirks, belt-count
+accuracy, etc.).
 
 ## Deployment
 
@@ -145,6 +186,10 @@ make mod-zip         # -> flma_<version>.zip; drop into ~/.factorio/mods/
 
 # Test with MCP inspector
 npx @modelcontextprotocol/inspector http://localhost:8080/mcp
+
+# Factory planner (see "Factory planner" section above) — build its recipe DB once:
+cd ~/code/homelab/apps/recipe-mcp && make build-db
+uv run python -m planner status
 ```
 
 ## Verifying in-game

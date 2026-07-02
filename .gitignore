@@ -22,3 +22,12 @@ build/
 .idea/
 .vscode/
 *.swp
+
+# Local dev server/client (dev/*.sh) -- secrets and runtime state
+dev/.rcon-password
+dev/.server.pid
+dev/.client.pid
+dev/logs/
+dev/saves/
+dev/.server-mod-list.json
+dev/.server-mod-settings.dat

@@ -21,6 +21,11 @@
 --      no registered on_nth_tick handlers and no registered build/destroy
 --      handlers at all (not just an early-return) — verify with F4
 --      "show-time-usage" that a disabled mod costs ~nothing.
+--   5. Sanctioned exception to the single-tick budget: export_recipes() builds
+--      and serializes an ~11 MB table in one tick. Its triggers are strictly
+--      event-shaped — init, mod-configuration change, recipe-affecting research
+--      (coalesced via a dirty flag), translation completion, an explicit remote
+--      call — never the periodic schedule.
 --
 -- ON_LOAD SAFETY: reschedule() is called from on_load (via script.on_load),
 -- where `game` is not accessible and `storage` must not be written (both are
@@ -604,6 +609,568 @@ local function start_baseline_scan()
 end
 
 --------------------------------------------------------------------------------
+-- recipe/prototype dump — recipes.json. Byte-compatible with the RecipeExporter
+-- mod's script-output/recipes.json (github.com/FactorioCalc/RecipeExporter) so
+-- recipe-mcp's build_db.py consumes it unchanged. ~11 MB on a Space Age game:
+-- built and serialized in a single tick, which is the sanctioned exception to
+-- the per-tick cost rules above — it happens only on init, on mod-configuration
+-- change, when a finished/reversed research actually unlocks recipes (coalesced
+-- via a dirty flag to at most one write per tick-interval), on translation-pass
+-- completion, and on remote.call("flma", "export_recipes"). Never periodically.
+--
+-- Unlike RecipeExporter (which holds the whole dump in a Lua upvalue across
+-- ticks while translations trickle in — not save-safe), only the small
+-- name → translated-string maps live in storage; the dump itself is rebuilt
+-- from prototypes (deterministic) on every write.
+--------------------------------------------------------------------------------
+
+-- Array of a table's keys, or nil when the table is nil/empty — empty sets are
+-- *absent* from the JSON rather than serialized as the ambiguous `{}`,
+-- matching RecipeExporter's keys() helper exactly.
+local function table_keys(t)
+  if t == nil then
+    return nil
+  end
+  local out = {}
+  for k, _ in pairs(t) do
+    out[#out + 1] = k
+  end
+  if #out == 0 then
+    return nil
+  end
+  return out
+end
+
+-- The recipes.json format is single-force (per-force fields: recipe
+-- enabled/productivity_bonus, tech enabled/researched), unlike tech.json's
+-- all-forces shape. Use the "player" force, falling back to the first
+-- non-blocklisted force for exotic scenarios that renamed it.
+local function recipes_force()
+  local f = game.forces["player"]
+  if f then
+    return f
+  end
+  for name, force in pairs(game.forces) do
+    if not FORCE_BLOCKLIST[name] then
+      return force
+    end
+  end
+end
+
+local TRANSLATION_SECTIONS = { "quality", "recipes", "items", "fluids", "entities", "technologies" }
+
+local function empty_translation_tables()
+  local t = {}
+  for _, s in ipairs(TRANSLATION_SECTIONS) do
+    t[s] = {}
+  end
+  return t
+end
+
+-- Best-effort translated_name lookup; nil (field absent) until a translation
+-- pass has completed. Consumers must fall back to the internal name.
+local function tr(section, name)
+  local maps = storage.flma and storage.flma.recipe_translations
+  local m = maps and maps[section]
+  return m and m[name] or nil
+end
+
+local function build_recipes_export()
+  local force = recipes_force()
+  local data = {}
+  data.game_version = script.active_mods["base"]
+
+  data.groups = {}
+  local function add_group(group)
+    if not data.groups[group.name] then
+      local g = {
+        name = group.name,
+        type = group.type,
+        order = group.order,
+      }
+      if group.type == "item-group" then
+        g.order_in_recipe = group.order_in_recipe
+      end
+      data.groups[group.name] = g
+    end
+    return group.name
+  end
+
+  data.quality = {}
+  for _, v in pairs(prototypes.quality) do
+    local q = {
+      name = v.name,
+      level = v.level,
+      next_probability = v.next_probability,
+      beacon_power_usage_multiplier = v.beacon_power_usage_multiplier,
+      mining_drill_resource_drain_multiplier = v.mining_drill_resource_drain_multiplier,
+      group = add_group(v.group),
+      subgroup = add_group(v.subgroup),
+      translated_name = tr("quality", v.name),
+    }
+    if v.next then
+      q.next = v.next.name
+    end
+    data.quality[v.name] = q
+  end
+
+  data.quality_names = {}
+  do
+    local i = 1
+    local name = "normal"
+    repeat
+      data.quality_names[i] = name
+      name = data.quality[name] and data.quality[name].next or nil
+      i = i + 1
+    until name == nil
+  end
+
+  data.recipes = {}
+  for _, v in pairs(force.recipes) do
+    data.recipes[v.name] = {
+      name = v.name,
+      category = v.category,
+      ingredients = v.ingredients,
+      products = v.products,
+      main_product = v.prototype.main_product,
+      allowed_effects = v.prototype.allowed_effects,
+      maximum_productivity = v.prototype.maximum_productivity,
+      energy = v.energy,
+      order = v.order,
+      group = add_group(v.group),
+      subgroup = add_group(v.subgroup),
+      enabled = v.enabled,
+      productivity_bonus = v.productivity_bonus,
+      translated_name = tr("recipes", v.name),
+    }
+  end
+
+  data.items = {}
+  for _, v in pairs(prototypes.item) do
+    data.items[v.name] = {
+      name = v.name,
+      type = v.type,
+      order = v.order,
+      group = add_group(v.group),
+      subgroup = add_group(v.subgroup),
+      stack_size = v.stack_size,
+      weight = v.weight,
+      fuel_category = v.fuel_category,
+      fuel_value = v.fuel_value,
+      module_effects = v.module_effects,
+      rocket_launch_products = v.rocket_launch_products,
+      flags = table_keys(v.flags),
+      translated_name = tr("items", v.name),
+    }
+  end
+
+  data.fluids = {}
+  for _, v in pairs(prototypes.fluid) do
+    data.fluids[v.name] = {
+      name = v.name,
+      order = v.order,
+      group = add_group(v.group),
+      subgroup = add_group(v.subgroup),
+      fuel_value = v.fuel_value,
+      translated_name = tr("fluids", v.name),
+    }
+  end
+
+  data.entities = {}
+  for _, v in pairs(prototypes.entity) do
+    local etype = v.type
+    if etype == "beacon"
+        or etype == "furnace"
+        or etype == "assembling-machine"
+        or etype == "boiler"
+        or etype == "rocket-silo" then
+      local energy_consumption = nil
+      local drain = nil
+      local energy_source = nil
+      local fuel_categories = nil
+      if v.electric_energy_source_prototype and v.energy_usage ~= nil then
+        energy_consumption = v.energy_usage * 60
+        drain = v.electric_energy_source_prototype.drain * 60
+        energy_source = "electric"
+      elseif v.burner_prototype and v.energy_usage ~= nil then
+        energy_consumption = v.energy_usage * 60
+        drain = 0
+        energy_source = "burner"
+        fuel_categories = table_keys(v.burner_prototype.fuel_categories)
+      end
+      local entity_info = {
+        name = v.name,
+        type = etype,
+        order = v.order,
+        group = v.group.name,
+        subgroup = v.subgroup.name,
+        crafting_speed = {},
+        crafting_categories = table_keys(v.crafting_categories),
+        allowed_effects = table_keys(v.allowed_effects),
+        module_inventory_size = v.module_inventory_size,
+        fixed_recipe = v.fixed_recipe,
+        effect_receiver = v.effect_receiver,
+        rocket_parts_required = v.rocket_parts_required,
+        distribution_effectivity = v.distribution_effectivity,
+        distribution_effectivity_bonus_per_quality_level = v.distribution_effectivity_bonus_per_quality_level,
+        supply_area_distance = {},
+        energy_consumption = energy_consumption,
+        drain = drain,
+        energy_source = energy_source,
+        fuel_categories = fuel_categories,
+        width = v.tile_width,
+        height = v.tile_height,
+        flags = table_keys(v.flags),
+        translated_name = tr("entities", v.name),
+      }
+      for _, qname in pairs(data.quality_names) do
+        entity_info.crafting_speed[qname] = v.get_crafting_speed(qname)
+        entity_info.supply_area_distance[qname] = v.get_supply_area_distance(qname)
+      end
+      if not next(entity_info.crafting_speed) then
+        entity_info.crafting_speed = nil
+      end
+      if not next(entity_info.supply_area_distance) then
+        entity_info.supply_area_distance = nil
+      end
+      data.entities[v.name] = entity_info
+    elseif etype == "mining-drill" then
+      local energy_consumption = nil
+      local drain = nil
+      local energy_source = nil
+      local fuel_categories = nil
+      if v.electric_energy_source_prototype and v.energy_usage ~= nil then
+        energy_consumption = v.energy_usage * 60
+        drain = v.electric_energy_source_prototype.drain * 60
+        energy_source = "electric"
+      elseif v.burner_prototype and v.energy_usage ~= nil then
+        energy_consumption = v.energy_usage * 60
+        drain = 0
+        energy_source = "burner"
+        fuel_categories = table_keys(v.burner_prototype.fuel_categories)
+      end
+      data.entities[v.name] = {
+        name = v.name,
+        type = etype,
+        resource_categories = table_keys(v.resource_categories),
+        mining_speed = v.mining_speed,
+        module_inventory_size = v.module_inventory_size,
+        energy_consumption = energy_consumption,
+        drain = drain,
+        energy_source = energy_source,
+        fuel_categories = fuel_categories,
+        width = v.tile_width,
+        height = v.tile_height,
+        translated_name = tr("entities", v.name),
+      }
+    elseif etype == "resource" then
+      local mp = v.mineable_properties
+      if mp and mp.minable then
+        data.entities[v.name] = {
+          name = v.name,
+          type = etype,
+          resource_category = v.resource_category,
+          mining_time = mp.mining_time,
+          required_fluid = mp.required_fluid,
+          fluid_amount = mp.fluid_amount,
+          product_name = mp.products and mp.products[1] and mp.products[1].name or nil,
+          translated_name = tr("entities", v.name),
+        }
+      end
+    end
+  end
+
+  data.technologies = {}
+  for name, v in pairs(force.technologies) do
+    local recipes_unlocked = {}
+    for _, effect in pairs(v.prototype.effects) do
+      if effect.type == "unlock-recipe" then
+        recipes_unlocked[#recipes_unlocked + 1] = effect.recipe
+      end
+    end
+    local prerequisites = {}
+    for prereq_name, _ in pairs(v.prerequisites) do
+      prerequisites[#prerequisites + 1] = prereq_name
+    end
+    local unit_ingredients = {}
+    for _, ing in pairs(v.research_unit_ingredients) do
+      unit_ingredients[#unit_ingredients + 1] = { name = ing.name, amount = ing.amount }
+    end
+    data.technologies[name] = {
+      name = name,
+      enabled = v.enabled,
+      researched = v.researched,
+      prerequisites = prerequisites,
+      recipes_unlocked = recipes_unlocked,
+      unit_count = v.research_unit_count,
+      unit_count_formula = v.research_unit_count_formula,
+      unit_energy = v.research_unit_energy,
+      unit_ingredients = unit_ingredients,
+      translated_name = tr("technologies", name),
+    }
+  end
+
+  return data
+end
+
+-- The single write entry point for every trigger. pcall so a pathological
+-- modded prototype (e.g. an inf/NaN value helpers.table_to_json refuses to
+-- serialize) can't take down the other export paths that call this.
+local function export_recipes()
+  local ok, err = pcall(function()
+    write_snapshot("recipes", build_recipes_export())
+  end)
+  storage.flma.recipes_dirty = false
+  if not ok then
+    log("flma: recipes.json export failed: " .. tostring(err))
+  end
+end
+
+-- Only recipe-unlocking (or recipe-productivity) research changes anything in
+-- recipes.json — damage/speed upgrades, the bulk of late-game research, never
+-- trigger the 11 MB rewrite.
+local function research_affects_recipes(tech)
+  if not (tech and tech.valid) then
+    return false
+  end
+  for _, effect in pairs(tech.prototype.effects) do
+    if effect.type == "unlock-recipe" or effect.type == "change-recipe-productivity" then
+      return true
+    end
+  end
+  return false
+end
+
+--------------------------------------------------------------------------------
+-- localised-name translation pass — best-effort, two-phase. recipes.json is
+-- always written immediately with internal names only (works headless, no
+-- player needed); when a player is connected, request_translation is issued
+-- for every exported prototype and the file is rewritten with translated_name
+-- filled in once all results arrive.
+--
+-- DESYNC SAFETY: request_translation results come back as broadcast input
+-- actions, so on_string_translated fires with identical data on *every* peer.
+-- The pending map and translation results live in synced storage, and
+-- reschedule() re-registers the handler on any peer whose storage shows a
+-- pass in flight (including a client that joins mid-pass) — every peer must
+-- run the same storage mutations or checksums diverge.
+--------------------------------------------------------------------------------
+
+-- Translation request ids don't survive a save/load or the requesting player
+-- disconnecting — after this many ticks a pending pass is considered dead and
+-- the next trigger starts a fresh one. Already-received translations are kept
+-- in storage, so a restarted pass only requests what's still missing.
+local TRANSLATION_STALE_TICKS = 3600
+
+-- The pass is time-sliced like the baseline building scan. Issuing every
+-- request in a single tick was field-tested to get the requesting client
+-- dropped from the game on a pyanodons-scale prototype set (18,704 requests
+-- in the tick it joined). This bounds it to TRANSLATION_REQUESTS_PER_DRAIN
+-- requests per TRANSLATION_DRAIN_TICKS ticks (~1,200/s → a full pyanodons
+-- pass in ~16s).
+local TRANSLATION_REQUESTS_PER_DRAIN = 100
+-- Must never equal flma-tick-interval (minimum 60): a second on_nth_tick
+-- registration with the same N would silently replace the periodic handler.
+local TRANSLATION_DRAIN_TICKS = 5
+
+local function on_string_translated(event)
+  local st = storage.flma
+  local pending = st and st.recipe_translation_pending
+  local entry = pending and pending[event.id]
+  if not entry then
+    return -- unrelated translation (another mod's request)
+  end
+  if event.translated then
+    st.recipe_translations[entry.section][entry.key] = event.result
+  end
+  pending[event.id] = nil
+  st.recipe_translation_pending_count = st.recipe_translation_pending_count - 1
+  if st.recipe_translation_pending_count <= 0 and st.recipe_translation_queue == nil then
+    -- Every queued request has been issued and answered.
+    st.recipe_translation_pending = nil
+    st.recipe_translation_pending_count = 0
+    st.recipe_translations_done = true
+    script.on_event(defines.events.on_string_translated, nil)
+    export_recipes() -- rewrite with translated_name filled in
+  end
+end
+
+-- The queue stores only {section, key}; the LocalisedString is re-resolved
+-- from prototypes at request time so storage never holds 18k localised-string
+-- tables across saves.
+local function localised_name_for(force, section, key)
+  if section == "quality" then
+    local p = prototypes.quality[key]
+    return p and p.localised_name
+  elseif section == "items" then
+    local p = prototypes.item[key]
+    return p and p.localised_name
+  elseif section == "fluids" then
+    local p = prototypes.fluid[key]
+    return p and p.localised_name
+  elseif section == "entities" then
+    local p = prototypes.entity[key]
+    return p and p.localised_name
+  elseif section == "recipes" then
+    local r = force and force.recipes[key]
+    return r and r.localised_name
+  elseif section == "technologies" then
+    local t = force and force.technologies[key]
+    return t and t.localised_name
+  end
+end
+
+local function abort_translation_pass()
+  local st = storage.flma
+  st.recipe_translation_queue = nil
+  st.recipe_translation_queue_index = nil
+  st.recipe_translation_player_index = nil
+  st.recipe_translation_pending = nil
+  st.recipe_translation_pending_count = 0
+  script.on_nth_tick(TRANSLATION_DRAIN_TICKS, nil)
+  script.on_event(defines.events.on_string_translated, nil)
+end
+
+local translation_drain_handler
+
+local function register_translation_drainer()
+  script.on_nth_tick(TRANSLATION_DRAIN_TICKS, translation_drain_handler)
+end
+
+translation_drain_handler = function()
+  local st = storage.flma
+  local queue = st.recipe_translation_queue
+  if not queue then
+    script.on_nth_tick(TRANSLATION_DRAIN_TICKS, nil)
+    return
+  end
+  local player = st.recipe_translation_player_index
+    and game.get_player(st.recipe_translation_player_index)
+  if not (player and player.valid and player.connected) then
+    -- Requester left mid-pass: keep what's translated so far, drop the rest.
+    -- The next on_player_joined_game starts a fresh, incremental pass.
+    abort_translation_pass()
+    return
+  end
+  local force = recipes_force()
+  local i = st.recipe_translation_queue_index
+  local last = math.min(i + TRANSLATION_REQUESTS_PER_DRAIN - 1, #queue)
+  for j = i, last do
+    local entry = queue[j]
+    local ls = localised_name_for(force, entry.section, entry.key)
+    if ls then
+      local id = player.request_translation(ls)
+      if id then
+        st.recipe_translation_pending[id] = entry
+        st.recipe_translation_pending_count = st.recipe_translation_pending_count + 1
+      end
+    end
+  end
+  st.recipe_translation_queue_index = last + 1
+  if st.recipe_translation_queue_index > #queue then
+    st.recipe_translation_queue = nil
+    st.recipe_translation_queue_index = nil
+    script.on_nth_tick(TRANSLATION_DRAIN_TICKS, nil)
+    if st.recipe_translation_pending_count <= 0 then
+      -- Nothing was actually requested (all resolvable strings already
+      -- translated) — no responses to wait for; finish now.
+      st.recipe_translation_pending = nil
+      st.recipe_translations_done = true
+      script.on_event(defines.events.on_string_translated, nil)
+      export_recipes()
+    end
+  end
+end
+
+-- Runtime contexts only (writes storage) — never reachable from on_load.
+local function start_translation_pass(player)
+  if not export_enabled() then
+    return
+  end
+  local st = storage.flma
+  if st.recipe_translations_done then
+    return
+  end
+  if not (player and player.valid and player.connected) then
+    return
+  end
+  local in_flight = st.recipe_translation_queue ~= nil or st.recipe_translation_pending ~= nil
+  if in_flight and game.tick - (st.recipe_translation_started_tick or 0) <= TRANSLATION_STALE_TICKS then
+    return -- a pass is already in flight and not stale
+  end
+
+  st.recipe_translations = st.recipe_translations or empty_translation_tables()
+  local translations = st.recipe_translations
+  local queue = {}
+  local function enqueue(section, key)
+    -- Incremental: skip anything a previous (aborted) pass already got.
+    if not translations[section][key] then
+      queue[#queue + 1] = { section = section, key = key }
+    end
+  end
+
+  -- Exactly the prototype sets build_recipes_export() emits.
+  for _, v in pairs(prototypes.quality) do
+    enqueue("quality", v.name)
+  end
+  local force = recipes_force()
+  for _, v in pairs(force.recipes) do
+    enqueue("recipes", v.name)
+  end
+  for _, v in pairs(prototypes.item) do
+    enqueue("items", v.name)
+  end
+  for _, v in pairs(prototypes.fluid) do
+    enqueue("fluids", v.name)
+  end
+  for _, v in pairs(prototypes.entity) do
+    local etype = v.type
+    if etype == "beacon" or etype == "furnace" or etype == "assembling-machine"
+        or etype == "boiler" or etype == "rocket-silo" or etype == "mining-drill" then
+      enqueue("entities", v.name)
+    elseif etype == "resource" then
+      local mp = v.mineable_properties
+      if mp and mp.minable then
+        enqueue("entities", v.name)
+      end
+    end
+  end
+  for _, v in pairs(force.technologies) do
+    enqueue("technologies", v.name)
+  end
+
+  if #queue == 0 then
+    -- Everything already translated (e.g. a prior pass finished requesting
+    -- but its done-flag reset was interrupted) — just embed what we have.
+    st.recipe_translations_done = true
+    export_recipes()
+    return
+  end
+  st.recipe_translation_queue = queue
+  st.recipe_translation_queue_index = 1
+  st.recipe_translation_player_index = player.index
+  st.recipe_translation_pending = {}
+  st.recipe_translation_pending_count = 0
+  st.recipe_translation_started_tick = game.tick
+  script.on_event(defines.events.on_string_translated, on_string_translated)
+  register_translation_drainer()
+end
+
+-- Kick a translation pass off the first connected player, if any — used from
+-- the lifecycle hooks right after an untranslated export. On a headless server
+-- with nobody connected this is a no-op; the on_player_joined_game handler
+-- picks it up when someone eventually joins.
+local function maybe_start_translation_pass()
+  if #game.connected_players > 0 then
+    start_translation_pass(game.connected_players[1])
+  end
+end
+
+local function on_player_joined(event)
+  start_translation_pass(game.get_player(event.player_index))
+end
+
+--------------------------------------------------------------------------------
 -- scheduler — wires up (or tears down) every handler based on current
 -- settings. Called from on_init, on_load, on_configuration_changed, and
 -- on_runtime_mod_setting_changed so registration always matches the synced
@@ -631,6 +1198,16 @@ local function ensure_storage()
   end
   if storage.flma.tracking_was_active == nil then
     storage.flma.tracking_was_active = false
+  end
+  storage.flma.recipe_translations = storage.flma.recipe_translations or empty_translation_tables()
+  if storage.flma.recipes_dirty == nil then
+    storage.flma.recipes_dirty = false
+  end
+  if storage.flma.recipe_translations_done == nil then
+    storage.flma.recipe_translations_done = false
+  end
+  if storage.flma.recipe_translation_pending_count == nil then
+    storage.flma.recipe_translation_pending_count = 0
   end
 end
 
@@ -709,13 +1286,34 @@ local function reschedule(from_on_load)
   script.on_event(BUILD_EVENTS, nil)
   script.on_event(DESTROY_EVENTS, nil)
   script.on_event(defines.events.on_tick, nil)
+  script.on_event(defines.events.on_string_translated, nil)
+  script.on_event(defines.events.on_player_joined_game, nil)
 
   if not export_enabled() then
     return -- fully idle: zero registered handlers, zero per-tick cost
   end
 
+  -- Reattach the translation-result handler and request drainer on any peer
+  -- whose (synced) storage shows a pass in flight — mandatory for desync
+  -- safety, see the translation section above. Read-only on storage, so
+  -- on_load-safe. (Reattached request ids are dead after a reload — the
+  -- drainer keeps issuing the rest of the queue with fresh ids, and the
+  -- stale-pass timeout covers a pass that was already fully issued.)
+  if storage.flma and (storage.flma.recipe_translation_pending or storage.flma.recipe_translation_queue) then
+    script.on_event(defines.events.on_string_translated, on_string_translated)
+  end
+  if storage.flma and storage.flma.recipe_translation_queue then
+    register_translation_drainer()
+  end
+  script.on_event(defines.events.on_player_joined_game, on_player_joined)
+
   local n = tick_interval()
   script.on_nth_tick(n, function()
+    -- O(1) when clean; coalesces research bursts into at most one recipes.json
+    -- rewrite per interval. The write itself is never periodic.
+    if storage.flma.recipes_dirty then
+      export_recipes()
+    end
     export_production_stats()
     export_logistics()
     export_research_snapshot()
@@ -724,11 +1322,17 @@ local function reschedule(from_on_load)
     end
   end)
 
-  script.on_event(defines.events.on_research_finished, function()
+  script.on_event(defines.events.on_research_finished, function(event)
     export_all_forces_tech()
+    if research_affects_recipes(event.research) then
+      storage.flma.recipes_dirty = true
+    end
   end)
-  script.on_event(defines.events.on_research_reversed, function()
+  script.on_event(defines.events.on_research_reversed, function(event)
     export_all_forces_tech()
+    if research_affects_recipes(event.research) then
+      storage.flma.recipes_dirty = true
+    end
   end)
   script.on_event(defines.events.on_research_started, function()
     export_all_forces_tech()
@@ -782,6 +1386,8 @@ script.on_init(function()
   if export_enabled() then
     export_all_forces_tech()
     export_research_snapshot()
+    export_recipes()
+    maybe_start_translation_pass()
   end
 end)
 
@@ -794,8 +1400,18 @@ end)
 
 script.on_configuration_changed(function()
   ensure_storage()
+  -- Mods changed: the recipe/prototype set and its localised strings may have
+  -- changed with them — throw away all translation state and re-export.
+  storage.flma.recipe_translations = empty_translation_tables()
+  storage.flma.recipe_translations_done = false
+  storage.flma.recipe_translation_pending = nil
+  storage.flma.recipe_translation_pending_count = 0
   handle_buildings_tracking_transition()
   reschedule(false)
+  if export_enabled() then
+    export_recipes()
+    maybe_start_translation_pass()
+  end
 end)
 
 script.on_event(defines.events.on_runtime_mod_setting_changed, function(event)
@@ -808,6 +1424,8 @@ script.on_event(defines.events.on_runtime_mod_setting_changed, function(event)
     if export_enabled() then
       export_all_forces_tech() -- prime tech.json immediately rather than waiting for the next research event
       export_research_snapshot()
+      export_recipes()
+      maybe_start_translation_pass()
     end
   end
 end)
@@ -831,12 +1449,18 @@ remote.add_interface("flma", {
       end
     end
     local msg = string.format(
-      "flma: export_enabled=%s buildings_enabled=%s buildings_initialized=%s tracked_buildings=%d lines_since_compact=%d",
+      "flma: export_enabled=%s buildings_enabled=%s buildings_initialized=%s tracked_buildings=%d lines_since_compact=%d recipes_dirty=%s translations_done=%s translations_pending=%d",
       tostring(export_enabled()),
       tostring(buildings_enabled()),
       tostring(initialized),
       count,
-      storage.flma and storage.flma.building_lines_since_compact or 0
+      storage.flma and storage.flma.building_lines_since_compact or 0,
+      tostring(storage.flma and storage.flma.recipes_dirty or false),
+      tostring(storage.flma and storage.flma.recipe_translations_done or false),
+      (storage.flma and storage.flma.recipe_translation_pending_count or 0)
+        + (storage.flma and storage.flma.recipe_translation_queue
+          and (#storage.flma.recipe_translation_queue - storage.flma.recipe_translation_queue_index + 1)
+          or 0)
     )
     game.print(msg)
     -- game.print is invisible to an RCON caller (it goes to chat/stdout, not
@@ -870,5 +1494,16 @@ remote.add_interface("flma", {
     end
     export_all_forces_tech()
     game.print("flma: forced an export cycle")
+  end,
+  -- Forces a recipes.json rewrite immediately (and kicks off a translation
+  -- pass if a player is connected and one hasn't completed yet). Works even
+  -- with flma-export-enabled off — an explicit call is its own authorization.
+  export_recipes = function()
+    ensure_storage()
+    export_recipes()
+    maybe_start_translation_pass()
+    local msg = "flma: recipes.json exported"
+    game.print(msg)
+    rcon.print(msg)
   end,
 })

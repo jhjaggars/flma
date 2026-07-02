@@ -1,4 +1,25 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.0
+Date: 2026-07-02
+  Features:
+    - New recipes.json export (script-output/flma/recipes.json): a
+      RecipeExporter-compatible dump of recipes, items, fluids, crafting
+      machines/mining drills/resources, technologies, qualities, and item
+      groups for the player force — replaces needing the separate
+      RecipeExporter mod and its manual dump_recipes console command, and
+      always matches the modpack of the running save. Written on init, on mod
+      configuration changes, when a finished/reversed research actually
+      unlocks recipes or changes recipe productivity (coalesced via a dirty
+      flag to at most one write per tick-interval — never periodic), and on
+      demand via remote.call("flma", "export_recipes").
+    - Best-effort localised names: the file is written immediately with
+      internal names only (works headless, no player required); when a player
+      is connected an async translation pass runs and the file is rewritten
+      with translated_name filled in on each object. Consumers must fall back
+      to the internal name. Translation requests are time-sliced (100 per 5
+      ticks) — issuing all of them in one tick got the requesting client
+      dropped from the game on a pyanodons-scale prototype set.
+---------------------------------------------------------------------------------------------------
 Version: 0.2.1
 Date: 2026-07-01
   Bugfixes:

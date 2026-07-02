@@ -6,7 +6,7 @@ bridge in `src/`, the planner CLI in `planner/`, `dev/summary.py`, or anything
 you write yourself). The mod writes the files described here; consumers read
 them and nothing else — there is no other channel between the two.
 
-Describes the format as written by mod version **0.2.1** (`mod/info.json`).
+Describes the format as written by mod version **0.3.0** (`mod/info.json`).
 Shape changes are noted in `mod/changelog.txt`; additions of new fields or new
 files are backwards-compatible and consumers must ignore keys they don't
 recognize.
@@ -25,6 +25,7 @@ copy; a consumer reads its own machine's files.
 | `production.json` | full-overwrite JSON | every `flma-tick-interval` ticks |
 | `logistics.json` | full-overwrite JSON | every `flma-tick-interval` ticks |
 | `inventories.json` | full-overwrite JSON | every `flma-tick-interval` ticks, only if `flma-export-inventories` is on |
+| `recipes.json` | full-overwrite JSON | on init, on mod-configuration change, when a finished/reversed research unlocks recipes or changes recipe productivity (coalesced to the next tick-interval), on translation-pass completion, and on `remote.call("flma", "export_recipes")` — never periodic |
 | `buildings.ndjson` | append-only NDJSON event log | on each build/mine event; periodically compacted (see below), only if `flma-export-buildings` is on |
 
 Nothing is written at all unless the `flma-export-enabled` map setting is on.
@@ -198,6 +199,97 @@ string on some local/dev servers.
 }
 ```
 
+## `recipes.json`
+
+Static recipe/prototype dump of the running game: recipes, items, fluids,
+crafting machines/mining drills/resources, technologies, qualities, and item
+groups. **Byte-compatible with the RecipeExporter mod's**
+`script-output/recipes.json` (github.com/FactorioCalc/RecipeExporter), so
+recipe-mcp's `build_db.py` consumes it unchanged — and because it comes from
+the live save, it always matches the modpack actually being played.
+
+Unlike every other snapshot this file is **big** (~11 MB on a Space Age game)
+and changes only when mods change or research unlocks recipes. Consumers
+should `stat()` it and rebuild derived data on mtime change — never
+poll-parse it. Consecutive exports of identical state are not byte-identical
+(Lua `pairs` iteration order varies); compare mtime, not content.
+
+Top-level object:
+
+```json
+{
+  "game_version": "2.0.66",
+  "groups":        { "<name>": { "name", "type", "order", "order_in_recipe?" } },
+  "quality":       { "<name>": { "name", "level", "next?", "next_probability?", "..." } },
+  "quality_names": ["normal", "uncommon", "..."],
+  "recipes":       { "<name>": { "...see below..." } },
+  "items":         { "<name>": { "name", "type", "order", "group", "subgroup", "stack_size", "weight", "fuel_category?", "fuel_value", "module_effects?", "rocket_launch_products", "flags?" } },
+  "fluids":        { "<name>": { "name", "order", "group", "subgroup", "fuel_value" } },
+  "entities":      { "<name>": { "...three shapes, see below..." } },
+  "technologies":  { "<name>": { "...see below..." } }
+}
+```
+
+All five main sections are **maps keyed by internal name**, not arrays.
+`game_version` is the `base` mod's version string.
+
+A recipe:
+
+```json
+"wooden-chest": {
+  "name": "wooden-chest",
+  "category": "crafting",
+  "ingredients": [ { "type": "item", "name": "wood", "amount": 2 } ],
+  "products":    [ { "type": "item", "name": "wooden-chest", "probability": 1, "amount": 1 } ],
+  "main_product": { "type": "item", "name": "wooden-chest", "probability": 1, "amount": 1 },
+  "allowed_effects": { "consumption": true, "speed": true, "productivity": false, "pollution": true, "quality": true },
+  "maximum_productivity": 1000000,
+  "energy": 0.5,
+  "order": "a[items]-a[wooden-chest]",
+  "group": "logistics",
+  "subgroup": "storage",
+  "enabled": true,
+  "productivity_bonus": 0,
+  "translated_name": "Wooden chest"
+}
+```
+
+- Products with a random yield carry `amount_min`/`amount_max` instead of
+  `amount` (e.g. uranium processing), plus `probability`.
+- `entities` holds three shapes distinguished by `type`: **crafting machines**
+  (`beacon`/`furnace`/`assembling-machine`/`boiler`/`rocket-silo` —
+  `crafting_categories`, per-quality `crafting_speed` map,
+  `module_inventory_size`, `energy_consumption`/`drain` in W,
+  `energy_source: "electric"|"burner"`, `width`/`height`, …), **mining drills**
+  (`resource_categories`, `mining_speed`, energy fields), and **resources**
+  (`resource_category`, `mining_time`, `required_fluid?`, `fluid_amount?`,
+  `product_name`).
+- A technology: `enabled`, `researched`, `prerequisites[]`,
+  `recipes_unlocked[]` (recipe names from its `unlock-recipe` effects),
+  `unit_count?`, `unit_count_formula?`, `unit_energy`, `unit_ingredients[]`
+  (`{name, amount}`).
+
+**Single-force.** The per-force fields — recipe `enabled`/`productivity_bonus`,
+technology `enabled`/`researched` — come from the `player` force only (unlike
+`tech.json`'s all-forces shape). That matches how the format's consumers treat
+the data.
+
+**`translated_name` is best-effort.** The file is written immediately with
+internal names only (no player required — works on a headless server). When a
+player is connected, an async localised-name translation pass runs and the
+file is rewritten with `translated_name` filled in on each object. The pass
+is time-sliced (requests issued in small per-tick chunks), so the translated
+rewrite lands some tens of seconds after a player joins, not instantly. On a
+server no player ever joins, the field never appears. Consumers must fall
+back to `name` (recipe-mcp's `build_db.py` already does). The locale is
+whichever connected player's client answered the pass.
+
+The empty-array-as-`{}` convention applies here too, with one wrinkle
+inherited from RecipeExporter: key-set fields built by its `keys()` helper
+(`flags`, `crafting_categories`, `allowed_effects` on entities,
+`fuel_categories`, `resource_categories`) are **absent entirely** when empty
+rather than `{}`.
+
 ## `buildings.ndjson`
 
 Append-only event log of placed buildings — the one dataset proportional to
@@ -244,4 +336,5 @@ interface instead:
 /c remote.call("flma", "status")           -- export state + tracked-building count
 /c remote.call("flma", "reset_buildings")  -- clear index, force a fresh baseline scan
 /c remote.call("flma", "export_now")       -- force one export cycle immediately
+/c remote.call("flma", "export_recipes")   -- force a recipes.json rewrite immediately
 ```

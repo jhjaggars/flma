@@ -24,7 +24,7 @@ Config is all env vars (`config.py`): `SCRIPT_OUTPUT_DIR`, `PORT`, `HOST`,
 | `get_player_inventory` | A connected player's main inventory |
 | `get_building_counts` | Placed-building counts by name/type |
 | `query_buildings` | Filter placed buildings by name/type/surface/force, with positions |
-| `get_snapshot_age` | Staleness (seconds) of each feed (including `buildings` and `research`) — sanity-check the mod is running |
+| `get_snapshot_age` | Staleness (seconds) of each feed (including `buildings`, `research`, and `recipes` — the last via a bare `stat()`; the bridge never parses the ~11 MB `recipes.json`) — sanity-check the mod is running |
 
 ## File-reading model (`game_state.py`)
 

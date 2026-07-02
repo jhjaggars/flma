@@ -26,9 +26,20 @@ Config: `RECIPE_MCP_DIR` (default `~/code/homelab/apps/recipe-mcp`),
 `cd $RECIPE_MCP_DIR && make build-db`). Reuses this repo's own
 `SCRIPT_OUTPUT_DIR` for live state.
 
-**Modpack alignment matters.** The committed recipe dump is a **Pyanodons**
-game; this machine's live save may be running a different modpack (Space Age,
-confirmed, at time of writing) — in which case live tech-scoping and
+**Modpack alignment matters — and is now solvable at the source.** The
+recipe DB only matches the live save if it was built from the same modpack.
+As of mod 0.3.0 the flma mod itself exports a RecipeExporter-compatible
+`recipes.json` from the running game (see `../SCHEMA.md`), so the aligned
+workflow is to build the DB from the live export:
+
+```bash
+cd ~/code/homelab/apps/recipe-mcp && \
+  uv run python -m src.build_db ~/.factorio/script-output/flma/recipes.json recipes.db
+```
+
+(or build to a separate path and point `RECIPES_DB` at it). If instead the DB
+comes from a stale/foreign dump (e.g. recipe-mcp's committed Pyanodons
+`recipes.json` while the live save runs Space Age), live tech-scoping and
 production-netting correctly report "no match" rather than silently mixing
 data across incompatible games. See `.claude/skills/factory-planner/SKILL.md`
 for the full workflow guide and caveats (recipe-selection quirks, belt-count

@@ -48,6 +48,12 @@ rules throughout (see its top-of-file comment for the full rationale):
 4. Everything is gated behind the synced `flma-export-enabled` runtime-global
    setting — disabled means zero registered handlers (verified via F4
    `show-time-usage`), not just an early-return inside a live handler.
+5. Sanctioned exception to the single-tick budget: `export_recipes()` builds
+   and serializes the ~11 MB `recipes.json` in one tick. Its triggers are
+   strictly event-shaped — init, mod-configuration change, recipe-affecting
+   research (coalesced via a dirty flag to at most one write per
+   tick-interval), translation-pass completion, or an explicit remote call —
+   never the periodic schedule.
 
 ## Settings (Mod settings → Map, or `/c settings.global[...] = {value=...}`)
 
@@ -74,6 +80,7 @@ Any change to what this mod writes must be reflected there and noted in
 | `production.json` | every `flma-tick-interval` (full overwrite) | per-force, per-surface item/fluid `input_counts`/`output_counts` (lifetime cumulative totals) **and** `input_rates_per_min`/`output_rates_per_min` (real per-minute flow, via `get_flow_count`) |
 | `logistics.json` | every `flma-tick-interval` (full overwrite) | per-force logistic networks: contents, robot counts |
 | `inventories.json` | every `flma-tick-interval`, if enabled (full overwrite) | connected players' main inventory contents |
+| `recipes.json` | on init / mod-config change / recipe-affecting research (coalesced) / translation completion / `remote.call("flma","export_recipes")` — never periodic (full overwrite, ~11 MB) | RecipeExporter-compatible dump of recipes, items, fluids, machines/drills/resources, technologies, qualities, groups (player force); `translated_name` filled in best-effort once a connected player's translation pass completes |
 | `buildings.ndjson` | on build/mine events (append), periodically compacted | `{"op":"add"/"remove", "entity":{...}}` event log |
 
 ## Debugging
@@ -84,7 +91,10 @@ interface instead: `/c remote.call("flma", "status")` prints export state and
 tracked-building count; `/c remote.call("flma", "reset_buildings")` clears the
 index and forces a fresh baseline scan under current rules, without needing a
 new save; `/c remote.call("flma", "export_now")` forces one export cycle
-immediately (useful when no players are connected and ticks aren't advancing).
+immediately (useful when no players are connected and ticks aren't advancing);
+`/c remote.call("flma", "export_recipes")` forces a `recipes.json` rewrite
+(and kicks a translation pass if a player is connected). `status` also reports
+`recipes_dirty` and translation-pass state.
 
 For iterating against a live game, use the local dev environment in `../dev/`
 (see `.claude/skills/factorio-dev/SKILL.md`) — note a **version bump in

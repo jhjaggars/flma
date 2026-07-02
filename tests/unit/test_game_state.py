@@ -211,6 +211,7 @@ class TestGameState:
             "inventories": None,
             "research": None,
             "buildings": None,
+            "recipes": None,
         }
 
     def test_get_research_returns_snapshot(self, tmp_path: Path) -> None:
@@ -230,6 +231,16 @@ class TestGameState:
         ages = gs.snapshot_ages()
         assert ages["buildings"] is not None
         assert ages["buildings"] >= 0
+
+    def test_snapshot_ages_reports_recipes_age_without_parsing(self, tmp_path: Path) -> None:
+        # recipes.json is ~11 MB in real games and only consumed out-of-band
+        # (recipe-mcp's build_db, the planner) — the bridge must stat() it,
+        # never parse it. Invalid JSON proves no parse happens.
+        (tmp_path / "recipes.json").write_text("{ not json at all")
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        ages = gs.snapshot_ages()
+        assert ages["recipes"] is not None
+        assert ages["recipes"] >= 0
 
 
 class TestGameStateLocking:

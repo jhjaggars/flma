@@ -221,6 +221,10 @@ class GameState:
         self.inventories = SnapshotFile(script_output_dir / "inventories.json")
         self.research = SnapshotFile(script_output_dir / "research.json")
         self.buildings = BuildingIndex(script_output_dir / "buildings.ndjson")
+        # recipes.json is ~11 MB and only consumed out-of-band (recipe-mcp's
+        # build_db, the planner) — deliberately NOT a SnapshotFile. The bridge
+        # never parses it; only its mtime is surfaced via snapshot_ages().
+        self.recipes_path = script_output_dir / "recipes.json"
 
     def refresh(self, force: bool = False) -> None:
         with self._lock:
@@ -281,4 +285,11 @@ class GameState:
                 "inventories": self.inventories.age_seconds(),
                 "research": self.research.age_seconds(),
                 "buildings": self.buildings.age_seconds(),
+                "recipes": self._recipes_age(),
             }
+
+    def _recipes_age(self) -> float | None:
+        try:
+            return max(0.0, time.time() - self.recipes_path.stat().st_mtime)
+        except OSError:
+            return None

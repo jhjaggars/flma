@@ -65,7 +65,11 @@ make mod-zip         # -> flma_<version>.zip; drop into ~/.factorio/mods/
 # Test with MCP inspector
 npx @modelcontextprotocol/inspector http://localhost:8080/mcp
 
-# Factory planner (see planner/CLAUDE.md) — build its recipe DB once:
-cd ~/code/homelab/apps/recipe-mcp && make build-db
+# Factory planner (see planner/CLAUDE.md) — build its recipe DB once.
+# Preferred source: flma's own live export (guaranteed to match the running
+# save, see SCHEMA.md `recipes.json`); `make build-db` uses recipe-mcp's
+# committed static dump instead.
+cd ~/code/homelab/apps/recipe-mcp && \
+  uv run python -m src.build_db ~/.factorio/script-output/flma/recipes.json recipes.db
 uv run python -m planner status
 ```

@@ -87,10 +87,13 @@ prompts).
    overlap ratio is the wrong metric and Jaccard similarity is used
    instead). When they don't match, `plan`/`have` still run, but live
    tech-scoping and production-netting are skipped/empty rather than silently
-   wrong — `status` reports this plainly. To exercise live netting for real,
-   the live save needs to be a Pyanodons game (or the recipe dump needs to be
-   re-built from a fresh `RecipeExporter` export of whatever modpack is
-   actually running — see that repo's `CLAUDE.md`).
+   wrong — `status` reports this plainly. **The fix**: as of flma mod 0.3.0
+   the mod exports its own RecipeExporter-compatible dump from the running
+   game (`~/.factorio/script-output/flma/recipes.json`, see `SCHEMA.md`), so
+   rebuild the DB from that and alignment is guaranteed:
+   `cd $RECIPE_MCP_DIR && uv run python -m src.build_db
+   ~/.factorio/script-output/flma/recipes.json recipes.db` (or build to a
+   separate path and point `RECIPES_DB` at it).
 2. **Recipe selection can pick a surprising alternate.** Pyanodons has
    synthetic/alternate recipes for many things that would normally be raw
    (e.g. ores producible from biomass byproduct chains). The engine's

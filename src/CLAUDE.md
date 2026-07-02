@@ -37,6 +37,18 @@ regardless of tool-call burstiness, and holds a coarse lock across its whole
 body so concurrent MCP tool calls (dispatched via `asyncio.to_thread`) can't
 race on `BuildingIndex`'s byte offset.
 
+`GameState` is constructed with `SCRIPT_OUTPUT_DIR` (the parent `flma/`
+directory) but every data file actually lives one level deeper, under a
+per-save `<save_id>` subdirectory the mod maintains (mod 0.3.1+, see
+`../SCHEMA.md`). `GameState._resolve_active_dir()` reads the mod's
+`current-save.json` pointer on every `refresh()`/`health_check()` and rebinds
+all the `SnapshotFile`/`BuildingIndex` instances to `<base>/<save_id>` when it
+changes — so pointing the bridge at a different save/server, or restarting the
+mod's server against a new save, is picked up live without restarting the
+bridge or touching `SCRIPT_OUTPUT_DIR`. No pointer yet (mod not enabled, or an
+old mod version) falls back to treating `SCRIPT_OUTPUT_DIR` itself as the data
+directory.
+
 ## Deployment
 
 The bridge reads a **local** Factorio client's `script-output/`, so it runs as a

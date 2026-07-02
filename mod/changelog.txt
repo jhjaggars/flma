@@ -1,4 +1,19 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.1
+Date: 2026-07-02
+  Changes:
+    - Every export file now lives under script-output/flma/<save_id>/ instead
+      of directly under script-output/flma/, where save_id is a short token
+      generated once per save and persisted in storage. Previously all saves
+      on a machine shared the same flat output directory, so switching which
+      save/server you pointed the bridge at could silently mix or clobber a
+      different save's buildings.ndjson, tech.json, etc. A new fixed-location
+      script-output/flma/current-save.json pointer ({"save_id":..., "tick":...})
+      lets a consumer find the active save's subdirectory without being
+      reconfigured on every switch; refreshed every export cycle and
+      immediately when flma-export-enabled turns on. remote.call("flma",
+      "status") now reports save_id and output_dir.
+---------------------------------------------------------------------------------------------------
 Version: 0.3.0
 Date: 2026-07-02
   Features:

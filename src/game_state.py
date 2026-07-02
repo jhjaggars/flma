@@ -15,10 +15,27 @@ base size. This module owns:
     replays from scratch in that case.
   - GameState: composes the above and is what src/server.py's tools query.
     Guards all reads/writes of its own state with one coarse lock, since
-    src/server.py calls it from concurrent request handlers.
+    src/server.py calls it from concurrent request handlers. Also resolves
+    which per-save subdirectory is currently active (see below) before every
+    refresh, so it follows the mod across save/server switches without the
+    operator having to reconfigure SCRIPT_OUTPUT_DIR.
 
 All file I/O here is synchronous; src/server.py wraps calls in
 asyncio.to_thread(), mirroring the AsyncDatabase pattern in apps/recipe-mcp.
+
+## Per-save directories
+
+Since mod version 0.3.1, every data file lives under a `<save_id>` subdirectory
+of the configured directory (`flma/<save_id>/tech.json`, etc.) rather than
+directly in it — this stops switching which save/server is running from
+silently mixing or clobbering a different save's files (see `SCHEMA.md`).
+GameState is still constructed with the *parent* directory and resolves the
+active `<save_id>` itself by reading the small `current-save.json` pointer the
+mod maintains there; if that pointer is absent (mod not enabled yet, or an
+older mod version), it falls back to treating the given directory as the data
+directory directly. The resolved subdirectory is re-checked on every
+`refresh()` (throttled like everything else here), so a save switch while the
+bridge keeps running is picked up without a restart.
 """
 
 from __future__ import annotations
@@ -35,6 +52,22 @@ logger = logging.getLogger(__name__)
 # Number of leading bytes of buildings.ndjson fingerprinted to detect
 # mod-side compaction — see BuildingIndex.refresh().
 _FINGERPRINT_BYTES = 256
+
+
+def _read_current_save_id(base_dir: Path) -> str | None:
+    """Reads the mod's current-save.json pointer, if present.
+
+    Returns None (not an exception) for "no pointer yet" (mod never enabled),
+    a torn read (truncate-then-write, same as every other file here), or a
+    malformed/missing save_id — all of which should fall back to treating
+    base_dir itself as the data directory rather than raising.
+    """
+    try:
+        data = json.loads((base_dir / "current-save.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    save_id = data.get("save_id")
+    return save_id if isinstance(save_id, str) and save_id else None
 
 
 class SnapshotFile:
@@ -210,21 +243,40 @@ class GameState:
     """
 
     def __init__(self, script_output_dir: Path, min_refresh_interval: float = 0.5) -> None:
-        self.dir = script_output_dir
+        self.base_dir = script_output_dir
         self.min_refresh_interval = min_refresh_interval
         self._last_refresh = 0.0
         self._lock = threading.RLock()
+        # None means "bound directly to base_dir" (no current-save.json seen
+        # yet) — matches _read_current_save_id's own "no pointer" return, so
+        # the first _resolve_active_dir() call only rebinds when a real
+        # save_id actually appears.
+        self._active_save_id: str | None = None
+        self._bind(script_output_dir)
 
-        self.tech = SnapshotFile(script_output_dir / "tech.json")
-        self.production = SnapshotFile(script_output_dir / "production.json")
-        self.logistics = SnapshotFile(script_output_dir / "logistics.json")
-        self.inventories = SnapshotFile(script_output_dir / "inventories.json")
-        self.research = SnapshotFile(script_output_dir / "research.json")
-        self.buildings = BuildingIndex(script_output_dir / "buildings.ndjson")
+    def _bind(self, data_dir: Path) -> None:
+        self.dir = data_dir
+        self.tech = SnapshotFile(data_dir / "tech.json")
+        self.production = SnapshotFile(data_dir / "production.json")
+        self.logistics = SnapshotFile(data_dir / "logistics.json")
+        self.inventories = SnapshotFile(data_dir / "inventories.json")
+        self.research = SnapshotFile(data_dir / "research.json")
+        self.buildings = BuildingIndex(data_dir / "buildings.ndjson")
         # recipes.json is ~11 MB and only consumed out-of-band (recipe-mcp's
         # build_db, the planner) — deliberately NOT a SnapshotFile. The bridge
         # never parses it; only its mtime is surfaced via snapshot_ages().
-        self.recipes_path = script_output_dir / "recipes.json"
+        self.recipes_path = data_dir / "recipes.json"
+
+    def _resolve_active_dir(self) -> None:
+        save_id = _read_current_save_id(self.base_dir)
+        if save_id != self._active_save_id:
+            logger.info(
+                "flma active save changed: %s -> %s",
+                self._active_save_id,
+                save_id,
+            )
+            self._active_save_id = save_id
+            self._bind(self.base_dir / save_id if save_id else self.base_dir)
 
     def refresh(self, force: bool = False) -> None:
         with self._lock:
@@ -232,6 +284,7 @@ class GameState:
             if not force and (now - self._last_refresh) < self.min_refresh_interval:
                 return
             self._last_refresh = now
+            self._resolve_active_dir()
             # SnapshotFile.read() is itself cheap when unchanged (mtime/size check).
             self.tech.read()
             self.production.read()
@@ -241,7 +294,9 @@ class GameState:
             self.buildings.refresh()
 
     def health_check(self) -> bool:
-        return self.dir.exists()
+        with self._lock:
+            self._resolve_active_dir()
+            return self.dir.exists()
 
     # -- query helpers used by server.py tools --------------------------------
 

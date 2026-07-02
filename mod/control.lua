@@ -1,7 +1,12 @@
 -- flma (Factorio Live MCP Agent) — control.lua
 --
--- Exports live game state to script-output/flma/ for a local process (the
--- factorio-live-mcp bridge, see apps/factorio-live-mcp/src/) to read.
+-- Exports live game state to script-output/flma/<save_id>/ for a local
+-- process (the factorio-live-mcp bridge, see apps/factorio-live-mcp/src/) to
+-- read. Every export file is namespaced under a save_id (generated once,
+-- persisted in `storage`) so switching between saves/servers on the same
+-- machine never mixes or clobbers a different save's files; see
+-- BASE_OUTPUT_DIR.."/current-save.json" below for how a consumer finds the
+-- active one.
 --
 -- EFFICIENCY IS THE DESIGN CONSTRAINT, NOT AN AFTERTHOUGHT:
 -- This mod is synced (it has a control stage, so its checksum must match every
@@ -36,7 +41,40 @@
 -- transition — is only reachable from on_init, on_configuration_changed, or
 -- on_runtime_mod_setting_changed.
 
-local OUTPUT_DIR = "flma"
+local BASE_OUTPUT_DIR = "flma"
+
+-- A short, mod-generated id (not the save's filename — Lua has no API to read
+-- that, and filenames aren't stable across renames/copies/autosave rotation
+-- anyway) that namespaces every export file under a directory unique to this
+-- save. Generated once and persisted in `storage`, so it survives forever
+-- with this save — this is what stops switching between saves/servers on one
+-- machine from silently mixing or clobbering each other's script-output
+-- files. Self-contained (doesn't call ensure_storage()) so it has no
+-- dependency-ordering requirement on where it sits relative to that function.
+local function save_id()
+  storage.flma = storage.flma or {}
+  storage.flma.save_id = storage.flma.save_id
+    or string.format("%04x%04x", math.random(0, 0xffff), math.random(0, 0xffff))
+  return storage.flma.save_id
+end
+
+local function output_dir()
+  return BASE_OUTPUT_DIR .. "/" .. save_id()
+end
+
+-- Small fixed-location pointer a consumer reads first to find the
+-- currently-active save's subdirectory, without being told the save_id out
+-- of band or reconfigured every time the operator switches saves/servers.
+-- Refreshed on every periodic export cycle and immediately when
+-- flma-export-enabled turns on. Only ever called from contexts where `game`
+-- is available (never on_load — see the file-level ON_LOAD SAFETY comment).
+local function write_current_pointer()
+  helpers.write_file(
+    BASE_OUTPUT_DIR .. "/current-save.json",
+    helpers.table_to_json({ save_id = save_id(), tick = game.tick }),
+    false
+  )
+end
 
 -- Entity types we don't consider a "placed building" for query_buildings.
 -- This is a blocklist by Factorio's built-in prototype `type`, not by name —
@@ -174,11 +212,11 @@ end
 -- here (execution is already local per-peer; for_player only restricts *which*
 -- peer performs the write, and we want all of them to).
 local function write_snapshot(name, data)
-  helpers.write_file(OUTPUT_DIR .. "/" .. name .. ".json", helpers.table_to_json(data), false)
+  helpers.write_file(output_dir() .. "/" .. name .. ".json", helpers.table_to_json(data), false)
 end
 
 local function append_line(name, data)
-  helpers.write_file(OUTPUT_DIR .. "/" .. name .. ".ndjson", helpers.table_to_json(data) .. "\n", true)
+  helpers.write_file(output_dir() .. "/" .. name .. ".ndjson", helpers.table_to_json(data) .. "\n", true)
 end
 
 -- Same as append_line but for many records in one call — one write_file
@@ -193,7 +231,7 @@ local function append_lines_batch(name, records, append)
   for i, data in ipairs(records) do
     lines[i] = helpers.table_to_json(data)
   end
-  helpers.write_file(OUTPUT_DIR .. "/" .. name .. ".ndjson", table.concat(lines, "\n") .. "\n", append)
+  helpers.write_file(output_dir() .. "/" .. name .. ".ndjson", table.concat(lines, "\n") .. "\n", append)
 end
 
 --------------------------------------------------------------------------------
@@ -479,7 +517,7 @@ local function compact_buildings()
   for _, rec in pairs(storage.flma.buildings) do
     records[#records + 1] = { t = game.tick, op = "add", entity = rec }
   end
-  helpers.write_file(OUTPUT_DIR .. "/buildings.ndjson", "", false) -- truncate
+  helpers.write_file(output_dir() .. "/buildings.ndjson", "", false) -- truncate
   append_lines_batch("buildings", records, true)
   storage.flma.building_lines_since_compact = 0
   storage.flma.building_total_lines = #records
@@ -1263,7 +1301,7 @@ local function handle_buildings_tracking_transition()
     storage.flma.baseline_in_progress = false
     storage.flma.baseline_chunks = nil
     storage.flma.baseline_entities = nil
-    helpers.write_file(OUTPUT_DIR .. "/buildings.ndjson", "", false) -- truncate
+    helpers.write_file(output_dir() .. "/buildings.ndjson", "", false) -- truncate
   end
   storage.flma.tracking_was_active = now_active
 end
@@ -1309,6 +1347,7 @@ local function reschedule(from_on_load)
 
   local n = tick_interval()
   script.on_nth_tick(n, function()
+    write_current_pointer()
     -- O(1) when clean; coalesces research bursts into at most one recipes.json
     -- rewrite per interval. The write itself is never periodic.
     if storage.flma.recipes_dirty then
@@ -1422,6 +1461,7 @@ script.on_event(defines.events.on_runtime_mod_setting_changed, function(event)
     handle_buildings_tracking_transition()
     reschedule(false)
     if export_enabled() then
+      write_current_pointer() -- discoverable immediately, not after the next tick-interval
       export_all_forces_tech() -- prime tech.json immediately rather than waiting for the next research event
       export_research_snapshot()
       export_recipes()
@@ -1449,7 +1489,9 @@ remote.add_interface("flma", {
       end
     end
     local msg = string.format(
-      "flma: export_enabled=%s buildings_enabled=%s buildings_initialized=%s tracked_buildings=%d lines_since_compact=%d recipes_dirty=%s translations_done=%s translations_pending=%d",
+      "flma: save_id=%s output_dir=%s export_enabled=%s buildings_enabled=%s buildings_initialized=%s tracked_buildings=%d lines_since_compact=%d recipes_dirty=%s translations_done=%s translations_pending=%d",
+      tostring(storage.flma and storage.flma.save_id or "(not yet assigned)"),
+      output_dir(),
       tostring(export_enabled()),
       tostring(buildings_enabled()),
       tostring(initialized),
@@ -1478,7 +1520,7 @@ remote.add_interface("flma", {
     storage.flma.baseline_in_progress = false
     storage.flma.baseline_chunks = nil
     storage.flma.baseline_entities = nil
-    helpers.write_file(OUTPUT_DIR .. "/buildings.ndjson", "", false) -- truncate
+    helpers.write_file(output_dir() .. "/buildings.ndjson", "", false) -- truncate
     game.print("flma: building index reset; re-scanning under current rules")
     reschedule(false)
   end,
@@ -1503,6 +1545,27 @@ remote.add_interface("flma", {
     export_recipes()
     maybe_start_translation_pass()
     local msg = "flma: recipes.json exported"
+    game.print(msg)
+    rcon.print(msg)
+  end,
+  -- Writes runtime-global settings directly. Factorio rejects
+  -- `settings.global[...] = ...` from an RCON /silent-command (no player,
+  -- and RCON isn't "the mod that made the setting") — this remote call runs
+  -- the write from inside flma's own script instead, which is exempt, so
+  -- dev/RCON workflows can toggle the mod on without a connected client
+  -- driving the Mod Settings GUI. Any argument left nil keeps that setting
+  -- unchanged.
+  configure = function(export_enabled_value, buildings_enabled_value, inventories_enabled_value)
+    if export_enabled_value ~= nil then
+      settings.global["flma-export-enabled"] = {value = export_enabled_value}
+    end
+    if buildings_enabled_value ~= nil then
+      settings.global["flma-export-buildings"] = {value = buildings_enabled_value}
+    end
+    if inventories_enabled_value ~= nil then
+      settings.global["flma-export-inventories"] = {value = inventories_enabled_value}
+    end
+    local msg = "flma: configured via remote call"
     game.print(msg)
     rcon.print(msg)
   end,

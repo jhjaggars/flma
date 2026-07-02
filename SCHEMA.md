@@ -6,7 +6,7 @@ bridge in `src/`, the planner CLI in `planner/`, `dev/summary.py`, or anything
 you write yourself). The mod writes the files described here; consumers read
 them and nothing else — there is no other channel between the two.
 
-Describes the format as written by mod version **0.3.0** (`mod/info.json`).
+Describes the format as written by mod version **0.3.1** (`mod/info.json`).
 Shape changes are noted in `mod/changelog.txt`; additions of new fields or new
 files are backwards-compatible and consumers must ignore keys they don't
 recognize.
@@ -18,19 +18,46 @@ machine it's running on — e.g. `~/.factorio/script-output/flma/` on Linux.
 Every peer in a multiplayer game (server and each client) writes its own local
 copy; a consumer reads its own machine's files.
 
+**Every data file lives under a per-save subdirectory, `flma/<save_id>/`.**
+`save_id` is a short token the mod generates once (`math.random`-derived hex)
+and persists in `storage`, so it survives forever with that save — Lua has no
+API to read the save's actual filename, and filenames aren't stable across
+renames/copies/autosave rotation anyway. This is what stops switching which
+save/server you're pointing a consumer at from silently mixing or clobbering a
+*different* save's `buildings.ndjson`, `tech.json`, etc. into the same files.
+
+A consumer that doesn't want to track `save_id` itself reads the small,
+fixed-location `flma/current-save.json` pointer first:
+
+```json
+{"save_id": "3fa1c9b2", "tick": 22516200}
+```
+
+— refreshed every `flma-tick-interval` cycle and immediately when
+`flma-export-enabled` turns on — then reads `flma/<save_id>/*` for the actual
+data. A consumer given `flma/` itself should re-check this pointer
+periodically (not just once at startup): if the operator points it at a
+different save/server without restarting the consumer, `save_id` changes and
+every snapshot/index needs to be re-opened against the new subdirectory rather
+than continuing to read stale files at the old path.
+
 | File | Kind | Written |
 |---|---|---|
-| `tech.json` | full-overwrite JSON | on research started/finished/queued/cancelled/reversed, and when exporting is (re)enabled |
-| `research.json` | full-overwrite JSON | every `flma-tick-interval` ticks |
-| `production.json` | full-overwrite JSON | every `flma-tick-interval` ticks |
-| `logistics.json` | full-overwrite JSON | every `flma-tick-interval` ticks |
-| `inventories.json` | full-overwrite JSON | every `flma-tick-interval` ticks, only if `flma-export-inventories` is on |
-| `recipes.json` | full-overwrite JSON | on init, on mod-configuration change, when a finished/reversed research unlocks recipes or changes recipe productivity (coalesced to the next tick-interval), on translation-pass completion, and on `remote.call("flma", "export_recipes")` — never periodic |
-| `buildings.ndjson` | append-only NDJSON event log | on each build/mine event; periodically compacted (see below), only if `flma-export-buildings` is on |
+| `current-save.json` | full-overwrite JSON, fixed location (`flma/`, not namespaced) | every `flma-tick-interval` ticks, and immediately when `flma-export-enabled` turns on |
+| `<save_id>/tech.json` | full-overwrite JSON | on research started/finished/queued/cancelled/reversed, and when exporting is (re)enabled |
+| `<save_id>/research.json` | full-overwrite JSON | every `flma-tick-interval` ticks |
+| `<save_id>/production.json` | full-overwrite JSON | every `flma-tick-interval` ticks |
+| `<save_id>/logistics.json` | full-overwrite JSON | every `flma-tick-interval` ticks |
+| `<save_id>/inventories.json` | full-overwrite JSON | every `flma-tick-interval` ticks, only if `flma-export-inventories` is on |
+| `<save_id>/recipes.json` | full-overwrite JSON | on init, on mod-configuration change, when a finished/reversed research unlocks recipes or changes recipe productivity (coalesced to the next tick-interval), on translation-pass completion, and on `remote.call("flma", "export_recipes")` — never periodic |
+| `<save_id>/buildings.ndjson` | append-only NDJSON event log | on each build/mine event; periodically compacted (see below), only if `flma-export-buildings` is on |
 
-Nothing is written at all unless the `flma-export-enabled` map setting is on.
-`remote.call("flma", "export_now")` from the Factorio console forces one
-export cycle immediately (useful on a paused or player-less server).
+Nothing is written at all unless the `flma-export-enabled` map setting is on
+(`current-save.json` included — a consumer sees no pointer file at all until
+then). `remote.call("flma", "export_now")` from the Factorio console forces
+one export cycle immediately (useful on a paused or player-less server);
+`remote.call("flma", "status")` reports the current `save_id` and resolved
+output directory.
 
 ## Conventions (apply to every file)
 

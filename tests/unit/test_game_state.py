@@ -243,6 +243,62 @@ class TestGameState:
         assert ages["recipes"] >= 0
 
 
+class TestGameStateSaveResolution:
+    """Since mod 0.3.1, data files live under base_dir/<save_id>/, discovered
+    via a current-save.json pointer -- see game_state.py's module docstring
+    and SCHEMA.md. These cover the bridge-side resolution logic."""
+
+    def test_no_pointer_falls_back_to_base_dir(self, tmp_path: Path) -> None:
+        write_json(tmp_path / "tech.json", {"tick": 1})
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert gs.get_tech() == {"tick": 1}
+        assert gs.dir == tmp_path
+
+    def test_follows_pointer_to_save_subdirectory(self, tmp_path: Path) -> None:
+        save_dir = tmp_path / "abc123"
+        save_dir.mkdir()
+        write_json(save_dir / "tech.json", {"tick": 5, "force": "player"})
+        write_json(tmp_path / "current-save.json", {"save_id": "abc123", "tick": 5})
+
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert gs.get_tech() == {"tick": 5, "force": "player"}
+        assert gs.dir == save_dir
+
+    def test_rebinds_when_active_save_changes(self, tmp_path: Path) -> None:
+        # Simulates switching which save/server is running without
+        # restarting the bridge.
+        old_dir, new_dir = tmp_path / "old", tmp_path / "new"
+        old_dir.mkdir()
+        new_dir.mkdir()
+        write_json(old_dir / "tech.json", {"tick": 1})
+        write_json(new_dir / "tech.json", {"tick": 2})
+        write_json(tmp_path / "current-save.json", {"save_id": "old", "tick": 1})
+
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert gs.get_tech() == {"tick": 1}
+
+        write_json(tmp_path / "current-save.json", {"save_id": "new", "tick": 2})
+        assert gs.get_tech() == {"tick": 2}
+        assert gs.dir == new_dir
+
+    def test_malformed_pointer_falls_back_to_base_dir(self, tmp_path: Path) -> None:
+        write_json(tmp_path / "tech.json", {"tick": 1})
+        (tmp_path / "current-save.json").write_text("{ not json", encoding="utf-8")
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert gs.get_tech() == {"tick": 1}
+
+    def test_health_check_follows_pointer(self, tmp_path: Path) -> None:
+        save_dir = tmp_path / "abc123"
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert gs.health_check() is True  # no pointer yet -- base_dir exists
+
+        write_json(tmp_path / "current-save.json", {"save_id": "abc123"})
+        assert gs.health_check() is False  # pointer resolves to a dir that doesn't exist yet
+
+        save_dir.mkdir()
+        assert gs.health_check() is True
+
+
 class TestGameStateLocking:
     def test_refresh_is_serialized_by_a_lock(self, tmp_path: Path) -> None:
         """GameState is queried from concurrent asyncio.to_thread() workers

@@ -7,6 +7,13 @@ from pathlib import Path
 # script-output/flma under the user's Factorio config dir, e.g.
 # ~/.factorio/script-output/flma on Linux. Point this at wherever the local
 # game client's script-output lives.
+#
+# Since mod 0.3.1 the actual data files live one level deeper, under a
+# per-save <save_id> subdirectory (see SCHEMA.md) — this should still point at
+# the *parent* flma/ directory. GameState resolves the active <save_id> itself
+# via the current-save.json pointer the mod maintains there, and re-checks it
+# on every refresh, so switching which save/server is running doesn't require
+# reconfiguring this or restarting the bridge.
 SCRIPT_OUTPUT_DIR: Path = Path(
     os.environ.get(
         "SCRIPT_OUTPUT_DIR",

@@ -65,23 +65,31 @@ rules throughout (see its top-of-file comment for the full rationale):
 | `flma-export-buildings` | `false` | Triggers the one-time baseline scan; off by default |
 | `flma-buildings-compact-threshold` | `20000` | Lines appended before `buildings.ndjson` is compacted |
 
-## Files written (`script-output/flma/`)
+## Files written (`script-output/flma/<save_id>/`)
 
 Summary only — **`../SCHEMA.md` is the authoritative format reference** (exact
 JSON shapes with real examples, the empty-array-as-`{}` quirk, quality-tiered
-contents arrays vs. plain count maps, torn-write handling, compaction detection).
-Any change to what this mod writes must be reflected there and noted in
-`changelog.txt`.
+contents arrays vs. plain count maps, torn-write handling, compaction detection,
+and the per-save `<save_id>` namespacing below). Any change to what this mod
+writes must be reflected there and noted in `changelog.txt`.
+
+Every data file is namespaced under a `save_id` the mod generates once and
+persists in `storage` (`save_id()`/`output_dir()` in `control.lua`) — this
+stops switching between saves/servers on one machine from silently mixing or
+clobbering a different save's files. A small fixed-location pointer,
+`flma/current-save.json`, points a consumer at the currently-active
+`save_id`.
 
 | File | Written | Contents |
 |---|---|---|
-| `tech.json` | on research started/finished/queued/cancelled/reversed events (full overwrite) | per-force: current research, progress, queue, all technologies + prerequisites |
-| `research.json` | every `flma-tick-interval` (full overwrite) | per-force: current research, progress, queue only (O(#forces), not the full tech table) — keeps `research_progress` live between the coarser research events that refresh `tech.json` |
-| `production.json` | every `flma-tick-interval` (full overwrite) | per-force, per-surface item/fluid `input_counts`/`output_counts` (lifetime cumulative totals) **and** `input_rates_per_min`/`output_rates_per_min` (real per-minute flow, via `get_flow_count`) |
-| `logistics.json` | every `flma-tick-interval` (full overwrite) | per-force logistic networks: contents, robot counts |
-| `inventories.json` | every `flma-tick-interval`, if enabled (full overwrite) | connected players' main inventory contents |
-| `recipes.json` | on init / mod-config change / recipe-affecting research (coalesced) / translation completion / `remote.call("flma","export_recipes")` — never periodic (full overwrite, ~11 MB) | RecipeExporter-compatible dump of recipes, items, fluids, machines/drills/resources, technologies, qualities, groups (player force); `translated_name` filled in best-effort once a connected player's translation pass completes |
-| `buildings.ndjson` | on build/mine events (append), periodically compacted | `{"op":"add"/"remove", "entity":{...}}` event log |
+| `current-save.json` (fixed location, not namespaced) | every `flma-tick-interval`, and immediately when `flma-export-enabled` turns on | `{"save_id":..., "tick":...}` — lets a consumer find the active save's subdirectory without hardcoding it |
+| `<save_id>/tech.json` | on research started/finished/queued/cancelled/reversed events (full overwrite) | per-force: current research, progress, queue, all technologies + prerequisites |
+| `<save_id>/research.json` | every `flma-tick-interval` (full overwrite) | per-force: current research, progress, queue only (O(#forces), not the full tech table) — keeps `research_progress` live between the coarser research events that refresh `tech.json` |
+| `<save_id>/production.json` | every `flma-tick-interval` (full overwrite) | per-force, per-surface item/fluid `input_counts`/`output_counts` (lifetime cumulative totals) **and** `input_rates_per_min`/`output_rates_per_min` (real per-minute flow, via `get_flow_count`) |
+| `<save_id>/logistics.json` | every `flma-tick-interval` (full overwrite) | per-force logistic networks: contents, robot counts |
+| `<save_id>/inventories.json` | every `flma-tick-interval`, if enabled (full overwrite) | connected players' main inventory contents |
+| `<save_id>/recipes.json` | on init / mod-config change / recipe-affecting research (coalesced) / translation completion / `remote.call("flma","export_recipes")` — never periodic (full overwrite, ~11 MB) | RecipeExporter-compatible dump of recipes, items, fluids, machines/drills/resources, technologies, qualities, groups (player force); `translated_name` filled in best-effort once a connected player's translation pass completes |
+| `<save_id>/buildings.ndjson` | on build/mine events (append), periodically compacted | `{"op":"add"/"remove", "entity":{...}}` event log |
 
 ## Debugging
 
@@ -115,12 +123,15 @@ from a live save):
 1. Copy `mod/` into `~/.factorio/mods/flma_<version>/` (or `make mod-zip` and use the
    in-game mod manager), enable it, start/load a save.
 2. Enable the map setting `flma-export-enabled` (Mod settings → Map). Confirm
-   `script-output/flma/tech.json` appears with a non-empty `forces.player` entry.
+   `script-output/flma/current-save.json` appears, and
+   `script-output/flma/<save_id>/tech.json` (that pointer's `save_id`) has a
+   non-empty `forces.player` entry.
 3. Research a technology; confirm `tech.json` updates without waiting a full
    `flma-tick-interval`.
-4. Run the bridge (`make run` with `SCRIPT_OUTPUT_DIR` pointed at that
-   `script-output/flma`) and exercise each tool via the MCP inspector or a client;
-   confirm `get_snapshot_age` tracks the live game.
+4. Run the bridge (`make run` with `SCRIPT_OUTPUT_DIR` pointed at
+   `script-output/flma`, the parent directory — it resolves `current-save.json`
+   itself) and exercise each tool via the MCP inspector or a client; confirm
+   `get_snapshot_age` tracks the live game.
 5. Enable `flma-export-buildings`; confirm `buildings.ndjson` gets a burst of `add`
    events (the baseline scan) spread across a few ticks, not one frame spike.
    ✅ Verified 2026-07: a 26,195-building base wrote its baseline across ~59 ticks.

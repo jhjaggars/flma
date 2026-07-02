@@ -54,14 +54,30 @@ def section(title: str) -> None:
     print(f"\n== {title}")
 
 
+def resolve_active_dir(base_dir: Path) -> Path:
+    """Since mod 0.3.1, data files live under base_dir/<save_id>/, not
+    directly in base_dir -- follow the current-save.json pointer the mod
+    maintains there. Falls back to base_dir itself if there's no pointer yet
+    (mod not enabled, or an older mod version)."""
+    pointer = base_dir / "current-save.json"
+    try:
+        save_id = json.loads(pointer.read_text()).get("save_id")
+    except (OSError, json.JSONDecodeError):
+        return base_dir
+    return base_dir / save_id if isinstance(save_id, str) and save_id else base_dir
+
+
 def main() -> None:
     default = Path.home() / ".factorio/script-output/flma"
-    out_dir = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ.get("FLMA_OUTPUT_DIR", default))
+    base_dir = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ.get("FLMA_OUTPUT_DIR", default))
+    if not base_dir.is_dir():
+        sys.exit(f"error: no such directory: {base_dir}\n(is flma-export-enabled on?)")
+    out_dir = resolve_active_dir(base_dir)
     if not out_dir.is_dir():
-        sys.exit(f"error: no such directory: {out_dir}\n(is flma-export-enabled on?)")
+        sys.exit(f"error: current-save.json points at {out_dir}, which doesn't exist")
 
     files = ["research.json", "production.json", "logistics.json",
-             "inventories.json", "tech.json", "buildings.ndjson"]
+             "inventories.json", "tech.json", "recipes.json", "buildings.ndjson"]
     section(f"feeds ({out_dir})")
     for name in files:
         print(f"    {name:<18} {age_str(out_dir / name)}")
@@ -94,6 +110,20 @@ def main() -> None:
                   + (f"  (researched {researched}/{total})" if total else ""))
             for q in queue[1:6]:
                 print(f"      queued: {q}")
+
+    # SCHEMA.md tells polling consumers to stat() recipes.json rather than
+    # parse it every cycle -- fine to ignore here since this is a one-shot
+    # smoke test, not a polling loop, and the full ~11MB parse is ~0.1s.
+    recipes = load(out_dir / "recipes.json")
+    if recipes:
+        section(f"recipes (static catalog, game {recipes.get('game_version', '?')})")
+        for cat in ("recipes", "items", "fluids", "entities", "technologies"):
+            vals = recipes.get(cat, {})
+            if not isinstance(vals, dict) or not vals:
+                continue
+            total = len(vals)
+            translated = sum(1 for v in vals.values() if isinstance(v, dict) and v.get("translated_name"))
+            print(f"    {cat:<13} {total:>6,} entries  ({translated:,} translated)")
 
     if production:
         section(f"production (last-minute rates, top {TOP_N})")
@@ -169,14 +199,20 @@ def main() -> None:
                 except json.JSONDecodeError:
                     bad += 1
                     continue
-                ent = rec.get("entity", {})
-                eid = ent.get("id")
-                if rec.get("op") == "add" and eid is not None:
-                    entities[eid] = ent
-                    adds += 1
-                elif rec.get("op") == "remove" and eid is not None:
-                    entities.pop(eid, None)
-                    removes += 1
+                op = rec.get("op")
+                if op == "add":
+                    ent = rec.get("entity", {})
+                    eid = ent.get("id")
+                    if eid is not None:
+                        entities[eid] = ent
+                        adds += 1
+                elif op == "remove":
+                    # Remove records carry a flat "id", not "entity.id" --
+                    # SCHEMA.md `buildings.ndjson`.
+                    eid = rec.get("id")
+                    if eid is not None:
+                        entities.pop(eid, None)
+                        removes += 1
         print(f"    {lines:,} log lines ({adds:,} add / {removes:,} remove"
               + (f" / {bad} unparseable" if bad else "") + f") -> {len(entities):,} live entities")
         by_force = Counter(e.get("force", "?") for e in entities.values())

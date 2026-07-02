@@ -10,7 +10,7 @@ remote server without RCON).
 Tools:
   get_research_status   -- current research, progress, queue
   get_tech_tree          -- researched / available / locked technologies
-  get_production_stats   -- item/fluid input & output rates
+  get_production_stats   -- item/fluid cumulative totals & per-minute rates
   get_logistics           -- logistic network contents and robot counts
   get_player_inventory    -- a connected player's main inventory
   get_building_counts     -- placed-building counts by name/type
@@ -27,7 +27,7 @@ from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
-from .config import LOG_LEVEL, MIN_REFRESH_INTERVAL_SECONDS, PORT, SCRIPT_OUTPUT_DIR
+from .config import HOST, LOG_LEVEL, MIN_REFRESH_INTERVAL_SECONDS, PORT, SCRIPT_OUTPUT_DIR
 from .game_state import GameState
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     name="factorio-live",
-    host="0.0.0.0",
+    host=HOST,
     port=PORT,
     streamable_http_path="/mcp",
 )
@@ -69,22 +69,46 @@ def _no_data_hint() -> dict:
 async def get_research_status(force: str = "player") -> dict:
     """Get the current research target, progress, and queue for a force.
 
+    Prefers research.json (refreshed every flma-tick-interval cycle, so
+    research_progress stays live) over tech.json's copy of the same fields
+    (only refreshed on research started/finished/queued/cancelled/reversed
+    events, plus whichever fields research.json's snapshot doesn't carry —
+    currently none, since tech.json's version is a superset for these three
+    fields). Falls back to tech.json if research.json is empty (e.g. an
+    older mod build that predates it).
+
     Args:
         force: Force name (default 'player', the usual single-player/co-op force).
     """
-    data = await asyncio.to_thread(state.get_tech)
-    if not data:
+    research_data = await asyncio.to_thread(state.get_research)
+    tech_data = await asyncio.to_thread(state.get_tech)
+    if not research_data and not tech_data:
         return _no_data_hint()
-    forces: dict = data.get("forces") or {}
-    force_data = forces.get(force)
-    if force_data is None:
-        return {"error": f"no snapshot for force '{force}'", "available_forces": list(forces)}
+
+    research_forces: dict = research_data.get("forces") or {}
+    tech_forces: dict = tech_data.get("forces") or {}
+    research_force_data = research_forces.get(force)
+    tech_force_data = tech_forces.get(force)
+    if research_force_data is None and tech_force_data is None:
+        available = sorted(set(research_forces) | set(tech_forces))
+        return {"error": f"no snapshot for force '{force}'", "available_forces": available}
+
+    research_force_data = research_force_data or {}
+    tech_force_data = tech_force_data or {}
     return {
-        "tick": data.get("tick"),
+        "tick": research_data.get("tick") if research_force_data else tech_data.get("tick"),
         "force": force,
-        "current_research": force_data.get("current_research"),
-        "research_progress": force_data.get("research_progress"),
-        "research_queue": force_data.get("research_queue") or [],
+        "current_research": research_force_data.get("current_research")
+        if research_force_data
+        else tech_force_data.get("current_research"),
+        "research_progress": research_force_data.get("research_progress")
+        if research_force_data
+        else tech_force_data.get("research_progress"),
+        "research_queue": (
+            research_force_data.get("research_queue") if research_force_data else None
+        )
+        or tech_force_data.get("research_queue")
+        or [],
     }
 
 
@@ -145,8 +169,18 @@ async def get_production_stats(
     surface: str | None = None,
     kind: str = "both",
 ) -> dict:
-    """Get production statistics (input/output flow counts) for items and/or
-    fluids on a surface.
+    """Get production statistics for items and/or fluids on a surface.
+
+    Each returned `items`/`fluids` block has two different kinds of numbers —
+    don't confuse them:
+      - `input_counts`/`output_counts`: CUMULATIVE totals since the game (or
+        force) began, not rates. `input_counts` is what the force has ever
+        *produced*; `output_counts` is what it has ever *consumed* (matches
+        the left/right split in the in-game production statistics GUI).
+      - `input_rates_per_min`/`output_rates_per_min`: real per-minute flow
+        rates (roughly the last 60s), suitable for "how much am I making
+        right now" — use these, not the cumulative counts, for anything
+        rate-shaped.
 
     Values are aggregated by the game engine (not scanned), so this is cheap
     to call frequently.
@@ -249,14 +283,24 @@ async def get_building_counts(force: str | None = None) -> dict:
     Args:
         force: Optional force name to filter to (e.g. 'player').
     """
-    buildings = await asyncio.to_thread(state.get_buildings)
-    if force is not None:
-        buildings = [b for b in buildings if b.get("force") == force]
-    if not buildings:
+    all_buildings = await asyncio.to_thread(state.get_buildings)
+    if not all_buildings:
         return {
             "total": 0,
             "hint": "No building data. Enable the 'flma-export-buildings' map setting.",
         }
+    buildings = all_buildings
+    if force is not None:
+        buildings = [b for b in buildings if b.get("force") == force]
+        if not buildings:
+            # Data exists, just not for this force -- distinct from "the mod
+            # isn't exporting buildings at all", so no setting-enable hint.
+            return {
+                "total": 0,
+                "available_forces": sorted(
+                    {b.get("force") for b in all_buildings if b.get("force")}
+                ),
+            }
     by_name: dict[str, int] = {}
     by_type: dict[str, int] = {}
     for b in buildings:

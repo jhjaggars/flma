@@ -13,7 +13,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from src import server
 from src.game_state import GameState
 
@@ -57,6 +56,65 @@ class TestGetResearchStatus:
         assert result["research_progress"] == 0.5
         assert result["research_queue"] == ["automation-2", "logistics-2"]
 
+    async def test_prefers_research_json_over_stale_tech_json(self, tmp_path: Path) -> None:
+        # research.json is refreshed every tick-interval cycle so
+        # research_progress stays live; tech.json only updates on research
+        # events, so it can be stale mid-research. When both exist, the live
+        # one wins.
+        _use_state(tmp_path)
+        write_json(
+            tmp_path / "tech.json",
+            {
+                "tick": 1,
+                "forces": {
+                    "player": {
+                        "current_research": "automation-2",
+                        "research_progress": 0.1,
+                        "research_queue": ["automation-2"],
+                        "technologies": {},
+                    }
+                },
+            },
+        )
+        write_json(
+            tmp_path / "research.json",
+            {
+                "tick": 50,
+                "forces": {
+                    "player": {
+                        "current_research": "automation-2",
+                        "research_progress": 0.9,
+                        "research_queue": ["automation-2"],
+                    }
+                },
+            },
+        )
+        result = await server.get_research_status()
+        assert result["research_progress"] == 0.9
+        assert result["tick"] == 50
+
+    async def test_falls_back_to_tech_json_when_research_json_absent(
+        self, tmp_path: Path
+    ) -> None:
+        _use_state(tmp_path)
+        write_json(
+            tmp_path / "tech.json",
+            {
+                "tick": 1,
+                "forces": {
+                    "player": {
+                        "current_research": "automation-2",
+                        "research_progress": 0.5,
+                        "research_queue": [],
+                        "technologies": {},
+                    }
+                },
+            },
+        )
+        result = await server.get_research_status()
+        assert result["current_research"] == "automation-2"
+        assert result["research_progress"] == 0.5
+
 
 class TestGetTechTree:
     async def test_classifies_researched_available_locked(self, tmp_path: Path) -> None:
@@ -68,7 +126,11 @@ class TestGetTechTree:
                 "forces": {
                     "player": {
                         "technologies": {
-                            "automation": {"researched": True, "enabled": True, "prerequisites": []},
+                            "automation": {
+                                "researched": True,
+                                "enabled": True,
+                                "prerequisites": [],
+                            },
                             "automation-2": {
                                 "researched": False,
                                 "enabled": True,
@@ -79,7 +141,11 @@ class TestGetTechTree:
                                 "enabled": True,
                                 "prerequisites": ["automation-2"],
                             },
-                            "cheating": {"researched": False, "enabled": False, "prerequisites": []},
+                            "cheating": {
+                                "researched": False,
+                                "enabled": False,
+                                "prerequisites": [],
+                            },
                         }
                     }
                 },
@@ -142,12 +208,75 @@ class TestGetProductionStats:
         result = await server.get_production_stats(force="enemy")
         assert "error" in result
 
+    async def test_passes_through_rate_fields_alongside_cumulative_counts(
+        self, tmp_path: Path
+    ) -> None:
+        _use_state(tmp_path)
+        write_json(
+            tmp_path / "production.json",
+            {
+                "tick": 1,
+                "forces": {
+                    "player": {
+                        "surfaces": {
+                            "nauvis": {
+                                "items": {
+                                    "input_counts": {"iron-plate": 1200},
+                                    "output_counts": {"iron-ore": 900},
+                                    "input_rates_per_min": {"iron-plate": 120.0},
+                                    "output_rates_per_min": {"iron-ore": 90.0},
+                                },
+                                "fluids": {"input_counts": {}, "output_counts": {}},
+                            }
+                        }
+                    }
+                },
+            },
+        )
+        result = await server.get_production_stats()
+        assert result["items"]["input_counts"]["iron-plate"] == 1200
+        assert result["items"]["input_rates_per_min"]["iron-plate"] == 120.0
+
 
 class TestBuildingsTools:
     async def test_get_building_counts_empty(self, tmp_path: Path) -> None:
         _use_state(tmp_path)
         result = await server.get_building_counts()
         assert result["total"] == 0
+        assert "hint" in result  # no data at all -- still points at the setting
+
+    async def test_get_building_counts_force_filter_matches_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        # Buildings exist, just not for the requested force -- this is a
+        # different situation from "the mod isn't exporting buildings at
+        # all", so the misleading "enable the setting" hint shouldn't appear.
+        gs = _use_state(tmp_path)
+        events_path = tmp_path / "buildings.ndjson"
+        with events_path.open("w", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "t": 1,
+                        "op": "add",
+                        "entity": {
+                            "id": 1,
+                            "name": "stone-furnace",
+                            "type": "furnace",
+                            "surface": "nauvis",
+                            "force": "player",
+                            "position": {"x": 0, "y": 0},
+                        },
+                    }
+                )
+                + "\n"
+            )
+        gs.refresh(force=True)
+
+        result = await server.get_building_counts(force="enemy")
+        assert result["total"] == 0
+        assert "hint" not in result
+        assert result["available_forces"] == ["player"]
 
     async def test_query_and_count_buildings(self, tmp_path: Path) -> None:
         gs = _use_state(tmp_path)
@@ -197,3 +326,17 @@ class TestGetSnapshotAge:
         assert result["script_output_dir"] == str(tmp_path)
         assert result["age_seconds"]["tech"] is not None
         assert result["age_seconds"]["production"] is None
+        assert "research" in result["age_seconds"]
+        assert "buildings" in result["age_seconds"]
+
+    async def test_reports_buildings_and_research_ages(self, tmp_path: Path) -> None:
+        gs = _use_state(tmp_path)
+        write_json(tmp_path / "research.json", {"tick": 1, "forces": {}})
+        with (tmp_path / "buildings.ndjson").open("w", encoding="utf-8") as f:
+            f.write(
+                json.dumps({"t": 1, "op": "add", "entity": {"id": 1, "name": "a"}}) + "\n"
+            )
+        gs.refresh(force=True)
+        result = await server.get_snapshot_age()
+        assert result["age_seconds"]["research"] is not None
+        assert result["age_seconds"]["buildings"] is not None

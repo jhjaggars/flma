@@ -4,11 +4,11 @@ event-log folding (including truncation/compaction detection)."""
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
 import pytest
-
 from src.game_state import BuildingIndex, GameState, SnapshotFile
 
 pytestmark = pytest.mark.unit
@@ -102,9 +102,43 @@ class TestBuildingIndex:
         assert {b["id"] for b in idx.all()} == {2}
         assert idx.last_tick == 100
 
+    def test_detects_compaction_via_fingerprint_when_size_does_not_shrink(
+        self, tmp_path: Path
+    ) -> None:
+        # A size-only check misses a compaction that rewrites the file to a
+        # size at or above our current offset -- the bridge would then
+        # resume reading at the old byte offset into unrelated new content.
+        # BuildingIndex additionally fingerprints the file's leading bytes,
+        # which always change on compaction (mod/control.lua's
+        # compact_buildings always starts the rewrite with a fresh tick
+        # value), so this case is still caught.
+        path = tmp_path / "buildings.ndjson"
+        append_ndjson(
+            path,
+            {"t": 1, "op": "add", "entity": {"id": 1, "name": "a"}},
+            {"t": 2, "op": "add", "entity": {"id": 2, "name": "b"}},
+        )
+        idx = BuildingIndex(path)
+        idx.refresh()
+        assert {b["id"] for b in idx.all()} == {1, 2}
+        old_size = path.stat().st_size
+
+        padding = "x" * old_size
+        new_line = json.dumps(
+            {"t": 999, "op": "add", "entity": {"id": 2, "name": "b", "extra": padding}}
+        )
+        path.write_text(new_line + "\n", encoding="utf-8")
+        assert path.stat().st_size >= old_size  # rewrite did NOT shrink below the old offset
+
+        idx.refresh()
+        assert {b["id"] for b in idx.all()} == {2}
+        assert idx.last_tick == 999
+
     def test_ignores_partial_trailing_line(self, tmp_path: Path) -> None:
         path = tmp_path / "buildings.ndjson"
-        path.write_text('{"t": 1, "op": "add", "entity": {"id": 1, "name": "a"}}\n', encoding="utf-8")
+        path.write_text(
+            '{"t": 1, "op": "add", "entity": {"id": 1, "name": "a"}}\n', encoding="utf-8"
+        )
         idx = BuildingIndex(path)
         idx.refresh()
         assert len(idx.all()) == 1
@@ -175,4 +209,67 @@ class TestGameState:
             "production": None,
             "logistics": None,
             "inventories": None,
+            "research": None,
+            "buildings": None,
         }
+
+    def test_get_research_returns_snapshot(self, tmp_path: Path) -> None:
+        write_json(
+            tmp_path / "research.json",
+            {"tick": 5, "forces": {"player": {"current_research": "automation"}}},
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert gs.get_research()["forces"]["player"]["current_research"] == "automation"
+
+    def test_snapshot_ages_reports_buildings_age(self, tmp_path: Path) -> None:
+        append_ndjson(
+            tmp_path / "buildings.ndjson",
+            {"t": 1, "op": "add", "entity": {"id": 1, "name": "a"}},
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        ages = gs.snapshot_ages()
+        assert ages["buildings"] is not None
+        assert ages["buildings"] >= 0
+
+
+class TestGameStateLocking:
+    def test_refresh_is_serialized_by_a_lock(self, tmp_path: Path) -> None:
+        """GameState is queried from concurrent asyncio.to_thread() workers
+        (src/server.py), so refresh() must hold a lock across its whole body.
+        The worst race it guards against: two threads both pass the
+        min_refresh_interval throttle and both call BuildingIndex.refresh(),
+        which would double-advance its byte offset and permanently skip
+        whatever fell in the gap.
+
+        Verified directly (not probabilistically): patch
+        BuildingIndex.refresh to record when each call starts/ends, run two
+        threads concurrently, and confirm the calls never overlap -- the
+        second call's start is never before the first call's end.
+        """
+        append_ndjson(
+            tmp_path / "buildings.ndjson",
+            {"t": 1, "op": "add", "entity": {"id": 1, "name": "a"}},
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+
+        original_refresh = gs.buildings.refresh
+        events: list[tuple[str, float]] = []
+
+        def slow_refresh() -> None:
+            events.append(("start", time.monotonic()))
+            time.sleep(0.1)
+            original_refresh()
+            events.append(("end", time.monotonic()))
+
+        gs.buildings.refresh = slow_refresh  # type: ignore[method-assign]
+
+        threads = [threading.Thread(target=gs.refresh, kwargs={"force": True}) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert [label for label, _ in events] == ["start", "end", "start", "end"]
+        first_end = events[1][1]
+        second_start = events[2][1]
+        assert second_start >= first_end

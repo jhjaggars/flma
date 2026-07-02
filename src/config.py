@@ -16,6 +16,12 @@ SCRIPT_OUTPUT_DIR: Path = Path(
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO").upper()
 PORT: int = int(os.environ.get("PORT", "8080"))
 
+# Bind address for the MCP server. Defaults to loopback-only — this bridge
+# serves unauthenticated live game state, so it should not be reachable from
+# the network unless the operator explicitly opts in (e.g. HOST=0.0.0.0 to
+# expose it to other machines on a trusted LAN).
+HOST: str = os.environ.get("HOST", "127.0.0.1")
+
 # Minimum seconds between re-reading files from disk per tool call. Snapshot
 # files are small and cadence is controlled by the mod's own
 # flma-tick-interval setting, so this just avoids re-parsing on every single

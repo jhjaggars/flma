@@ -3,7 +3,7 @@
 import nox
 
 PYTHON_VERSION = None  # Use current Python interpreter
-SRC_DIRS = ["src", "tests"]
+SRC_DIRS = ["src", "planner", "tests"]
 
 nox.options.sessions = ["lint", "typecheck", "tests"]
 
@@ -17,8 +17,8 @@ TEST_DEPS = ["pytest", "pytest-asyncio", "pytest-cov"]
 def lint(session):
     """Run code linters (ruff)."""
     session.install("ruff")
-    session.run("ruff", "check", "src/", *session.posargs)
-    session.run("ruff", "format", "--check", "src/")
+    session.run("ruff", "check", "src/", "planner/", *session.posargs)
+    session.run("ruff", "format", "--check", "src/", "planner/")
     session.log("✓ Linting passed!")
 
 
@@ -26,8 +26,8 @@ def lint(session):
 def format(session):
     """Auto-format code with ruff."""
     session.install("ruff")
-    session.run("ruff", "format", "src/", "tests/")
-    session.run("ruff", "check", "--fix", "src/", "tests/")
+    session.run("ruff", "format", "src/", "planner/", "tests/")
+    session.run("ruff", "check", "--fix", "src/", "planner/", "tests/")
     session.log("✓ Code formatted!")
 
 
@@ -38,6 +38,7 @@ def typecheck(session):
     session.run(
         "mypy",
         "src/",
+        "planner/",
         "--ignore-missing-imports",
         "--no-strict-optional",
         "--warn-unused-ignores",

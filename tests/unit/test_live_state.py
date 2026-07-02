@@ -1,0 +1,128 @@
+"""Unit tests for planner/live_state.py's net_production: sign correctness
+(input = produced, output = consumed) and the rates-only behavior (no
+silent fallback to lifetime cumulative totals when the mod snapshot predates
+the per-minute rate fields)."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from planner import live_state
+from src.game_state import GameState
+
+pytestmark = pytest.mark.unit
+
+
+def write_json(path: Path, data: dict) -> None:
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _production_with_rates(surface_items: dict, surface_fluids: dict | None = None) -> dict:
+    return {
+        "tick": 1,
+        "forces": {
+            "player": {
+                "surfaces": {
+                    "nauvis": {
+                        "items": surface_items,
+                        "fluids": surface_fluids
+                        or {
+                            "input_counts": {},
+                            "output_counts": {},
+                            "input_rates_per_min": {},
+                            "output_rates_per_min": {},
+                        },
+                    }
+                }
+            }
+        },
+    }
+
+
+class TestNetProduction:
+    def test_net_is_input_minus_output(self, tmp_path: Path) -> None:
+        # In LuaFlowStatistics, input_counts = what the force *produced*,
+        # output_counts = what it *consumed*. A force producing 120/min of
+        # iron-plate and consuming 30/min of it (e.g. some feeds back into
+        # another recipe) should show net = +90/min, not -90/min.
+        write_json(
+            tmp_path / "production.json",
+            _production_with_rates(
+                {
+                    "input_counts": {"iron-plate": 12000},
+                    "output_counts": {"iron-plate": 3000},
+                    "input_rates_per_min": {"iron-plate": 120.0},
+                    "output_rates_per_min": {"iron-plate": 30.0},
+                }
+            ),
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        net = live_state.net_production(gs)
+        assert net["iron-plate"] == pytest.approx(90.0)
+
+    def test_pure_consumption_is_negative(self, tmp_path: Path) -> None:
+        write_json(
+            tmp_path / "production.json",
+            _production_with_rates(
+                {
+                    "input_counts": {},
+                    "output_counts": {"iron-ore": 6000},
+                    "input_rates_per_min": {},
+                    "output_rates_per_min": {"iron-ore": 60.0},
+                }
+            ),
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        net = live_state.net_production(gs)
+        assert net["iron-ore"] == pytest.approx(-60.0)
+
+    def test_missing_rate_fields_returns_empty_rather_than_using_cumulative_totals(
+        self, tmp_path: Path
+    ) -> None:
+        # Older mod snapshot: only the lifetime cumulative totals are
+        # present, no *_rates_per_min fields. Falling back to cumulative
+        # totals here would silently mislabel a lifetime sum as a per-minute
+        # rate, so this must report "no data" (empty) instead of a wrong
+        # number.
+        write_json(
+            tmp_path / "production.json",
+            _production_with_rates(
+                {
+                    "input_counts": {"iron-plate": 12000},
+                    "output_counts": {"iron-plate": 3000},
+                }
+            ),
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        net = live_state.net_production(gs)
+        assert net == {}
+
+    def test_sums_across_surfaces(self, tmp_path: Path) -> None:
+        data = _production_with_rates(
+            {
+                "input_counts": {"iron-plate": 100},
+                "output_counts": {},
+                "input_rates_per_min": {"iron-plate": 10.0},
+                "output_rates_per_min": {},
+            }
+        )
+        data["forces"]["player"]["surfaces"]["vulcanus"] = {
+            "items": {
+                "input_counts": {"iron-plate": 50},
+                "output_counts": {},
+                "input_rates_per_min": {"iron-plate": 5.0},
+                "output_rates_per_min": {},
+            },
+            "fluids": {
+                "input_counts": {},
+                "output_counts": {},
+                "input_rates_per_min": {},
+                "output_rates_per_min": {},
+            },
+        }
+        write_json(tmp_path / "production.json", data)
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        net = live_state.net_production(gs)
+        assert net["iron-plate"] == pytest.approx(15.0)

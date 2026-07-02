@@ -100,19 +100,49 @@ prompts).
    producer-selection heuristic (first enabled, alphabetically, absent a
    direct name match — see `engine._pick_producer`) can pick one of these
    over the "obvious" recipe, expanding rate calculations through a long
-   unrelated chain instead of stopping at the raw resource. Use `--stop-items
+   unrelated chain instead of stopping at the raw resource. Tech-level
+   filtering (caveat below) narrows this since a tech-locked alternate can no
+   longer win, but doesn't eliminate it — two recipes can both be currently
+   buildable and still pick the "wrong" one. Use `--stop-items
    <comma-separated ids>` on `plan`/`expand` to pin known raw inputs (ores,
    basic raw resources) and short-circuit this. If a plan's `raw_inputs`
    look wrong, run `expand` on the same product to see which recipe chain
    was actually selected.
-3. **Belt/pipe throughput is a placeholder.** Neither `recipes.json` nor the
+3. **`plan`/`expand` filter by your actual research, live.** When the
+   modpack is aligned (see caveat 1), both commands pass the save's
+   currently-researched tech ids into the engine (`assume_researched`) and
+   turn on `only_enabled` — so recipe selection, crafting-machine choice,
+   *and* mining-drill choice all skip anything whose build recipe needs
+   research you haven't completed, picking the fastest option you can
+   actually build instead. A recipe/drill that's the only producer for an
+   item but is tech-locked makes that item fall back to a raw input, printed
+   under `tech-locked (falling back to raw input ...)` naming the missing
+   research; a tech-locked drill for an item that *does* have an eligible
+   drill appears under `blocked drills`, so upgrade paths (e.g. "researching
+   Mining machines - Stage 3 gets you a faster drill") stay visible instead
+   of silently vanishing. Note the DB's own `technologies.researched` /
+   `recipes.enabled` snapshot columns are close to useless for this (the
+   committed `recipes.db` was built at/near game start, so almost everything
+   reads unresearched) — the live tech ids from `tech.json` are what actually
+   drive this, which is why it's gated on modpack alignment.
+4. **Mining can have more than one extraction path.** Pyanodons resources are
+   often mineable multiple ways (e.g. ore-tin as a steam-fed
+   `basic-with-fluid` patch via a Fluid mining drill, or as fluid-free
+   `tin-rock` via a dedicated Tin mine) — `plan`'s `drills` section lists
+   every *currently-buildable* path (see caveat 3), tagged with
+   `[resource_category]` when more than one remains eligible. Required-fluid
+   consumption (e.g. Steam) for fluid-fed patches is shown inline
+   (`+N <fluid>/min`) but is **not** folded into the main `raw inputs` total,
+   since which path is actually built is a per-base decision — check the
+   `drills` section for the real fluid cost of whichever path you use.
+5. **Belt/pipe throughput is a placeholder.** Neither `recipes.json` nor the
    DB contains belt-speed or pipe-throughput data (confirmed absent from the
    RecipeExporter dump). `planner/throughput.py` hardcodes base/Space-Age
    belt tiers and a rough pipe figure; Pyanodons' actual belt tiers and its
    `py-transport-belt-capacity-N` research multipliers aren't filled in yet.
    Treat belt counts as order-of-magnitude, not exact, until that module is
    updated — it's flagged in `plan`/`status` output too.
-4. **Drill/raw estimates ignore modules, productivity, and ore purity** — the
+6. **Drill/raw estimates ignore modules, productivity, and ore purity** — the
    engine already labels these `approximate`; don't present them as exact.
 
 ## Configuration

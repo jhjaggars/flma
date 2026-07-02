@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from collections import Counter
 from types import ModuleType
 
 from planner import config, live_state, throughput
@@ -250,10 +251,40 @@ async def cmd_plan(args: argparse.Namespace) -> int:
     if len(raw_inputs) > args.top:
         print(f"  ... {len(raw_inputs) - args.top} more (raise --top to see all)")
 
+    tech_locked_notes = [n for n in result.get("selection_notes", []) if "tech-locked" in n]
+    if tech_locked_notes:
+        print("\ntech-locked (falling back to raw input at your current research level):")
+        for n in tech_locked_notes:
+            print(f"  {n}")
+
     if result["drills"]:
-        print("\ndrills (approximate — ignores purity/productivity/fluid reqs):")
+        print("\ndrills (approximate — ignores purity/productivity bonuses):")
+        by_resource = Counter(d["resource"] for d in result["drills"])
         for d in result["drills"]:
-            print(f"  {d['drill_count']:>5}x  {d['drill_name']}  for {d['resource']}")
+            line = f"  {d['drill_count']:>5}x  {d['drill_name']}  for {d['resource']}"
+            if by_resource[d["resource"]] > 1:
+                # More than one extraction path exists for this raw input
+                # (e.g. a steam-fed patch vs. a fluid-free rock deposit) —
+                # tag which resource_category each option is so it's clear
+                # these are alternatives, not a combined requirement.
+                line += f"  [{d['resource_category']}]"
+            if d.get("required_fluid"):
+                line += f"  (+{_fmt_num(d['fluid_rate_per_min'])} {d['required_fluid']}/min)"
+            print(line)
+
+    if result.get("blocked_drills"):
+        print("\nblocked drills (locked at your current research level):")
+        seen: set[tuple[str, str]] = set()
+        for bd in result["blocked_drills"]:
+            key = (bd["resource"], bd["drill_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            needs = ", ".join(bd["requires_research"]) or "unknown research"
+            print(
+                f"  {bd['drill_name']}  for {bd['resource']}  [{bd['resource_category']}]"
+                f"  needs: {needs}"
+            )
 
     if not throughput.VALUES_ARE_PYANODONS_ACCURATE:
         print(
@@ -281,10 +312,23 @@ async def cmd_expand(args: argparse.Namespace) -> int:
     if row is None:
         return _print_ambiguous(args.product, candidates)
 
+    gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
+    db_tech_ids = await _db_tech_ids(engine)
+    align = live_state.modpack_alignment(gs, db_tech_ids, force=args.force)
+    extra_unlocked: frozenset[str] = frozenset()
+    if align["aligned"]:
+        researched = live_state.researched_technologies(gs, force=args.force)
+        extra_unlocked = await engine.unlocked_recipes_for_techs(researched)
+    else:
+        print(
+            "  (live tech-scoping skipped — recipes.db and live save are different modpacks; see `status`)"
+        )
+
     amount = args.rate * 60.0 if args.unit == "per-sec" else args.rate
     stop_items = frozenset(s.strip() for s in (args.stop_items or "").split(",") if s.strip())
     totals_items: dict[str, float] = {}
     totals_fluids: dict[str, float] = {}
+    selection_notes: list[str] = []
     tree = await engine._expand_node(
         row["name"],
         row["kind"],
@@ -301,7 +345,9 @@ async def cmd_expand(args: argparse.Namespace) -> int:
         totals_fluids=totals_fluids,
         unresolved=[],
         alternates_map={},
-        selection_notes=[],
+        selection_notes=selection_notes,
+        extra_unlocked=extra_unlocked,
+        enforce_tech=bool(extra_unlocked),
     )
 
     print(
@@ -316,6 +362,13 @@ async def cmd_expand(args: argparse.Namespace) -> int:
     )
     for k, v in combined[: args.top]:
         print(f"  {k}: {_fmt_num(v)}")
+
+    tech_locked_notes = [n for n in selection_notes if "tech-locked" in n]
+    if tech_locked_notes:
+        print("\ntech-locked (falling back to raw input at your current research level):")
+        for n in tech_locked_notes:
+            print(f"  {n}")
+
     if len(combined) > args.top:
         print(f"  ... {len(combined) - args.top} more (raise --top to see all)")
     return 0
@@ -501,6 +554,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_expand.add_argument("--unit", choices=["per-sec", "per-min"], default="per-sec")
     p_expand.add_argument("--max-depth", type=int, default=6)
     p_expand.add_argument("--top", type=int, default=15, help="max raw totals to show (default 15)")
+    p_expand.add_argument(
+        "--force", default="player", help="Factorio force to scope live-state to (default: player)"
+    )
     p_expand.add_argument(
         "--stop-items",
         default=None,

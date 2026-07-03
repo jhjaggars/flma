@@ -248,6 +248,9 @@ async def _plan_reuse_candidates(
     if row is None:
         return [], []
     extra_unlocked = await engine.unlocked_recipes_for_techs(scoping.get("assume_researched"))
+    stop_set = frozenset(scoping.get("stop_items", []))
+    if scoping.get("auto_stop_raw", True):
+        stop_set = stop_set | await engine._auto_raw_items()
     tree = await engine._expand_node(
         row["name"],
         row["kind"],
@@ -256,7 +259,7 @@ async def _plan_reuse_candidates(
         max_depth=args.max_depth,
         exclude_cats=engine._DEFAULT_EXCLUDE,
         stop_cats=frozenset(),
-        stop_items=frozenset(scoping.get("stop_items", [])),
+        stop_items=stop_set,
         prefer_enabled=True,
         overrides=recipe_overrides,
         ancestors=frozenset(),
@@ -484,6 +487,7 @@ async def cmd_plan(args: argparse.Namespace) -> int:
 
     if args.stop_items:
         scoping["stop_items"] = [s.strip() for s in args.stop_items.split(",") if s.strip()]
+    scoping["auto_stop_raw"] = args.auto_stop_raw
 
     recipe_overrides = _parse_recipe_overrides(args.recipe)
     if recipe_overrides:
@@ -549,6 +553,8 @@ async def cmd_expand(args: argparse.Namespace) -> int:
 
     amount = args.rate * 60.0 if args.unit == "per-sec" else args.rate
     stop_items = frozenset(s.strip() for s in (args.stop_items or "").split(",") if s.strip())
+    if args.auto_stop_raw:
+        stop_items = stop_items | await engine._auto_raw_items()
     totals_items: dict[str, float] = {}
     totals_fluids: dict[str, float] = {}
     selection_notes: list[str] = []
@@ -792,6 +798,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_plan.add_argument(
+        "--no-auto-stop-raw",
+        dest="auto_stop_raw",
+        action="store_false",
+        default=True,
+        help=(
+            "by default, real mineable/harvestable map resources (water, ores, "
+            "stone, coal, confirmed-simple flora, ...) already stop expansion "
+            "without needing --stop-items — pass this to see the full synthetic "
+            "byproduct-recipe expansion for those too"
+        ),
+    )
+    p_plan.add_argument(
         "--recipe",
         default=None,
         help=(
@@ -824,6 +842,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--stop-items",
         default=None,
         help="comma-separated item ids to treat as raw and stop expanding (e.g. iron-ore,copper-ore)",
+    )
+    p_expand.add_argument(
+        "--no-auto-stop-raw",
+        dest="auto_stop_raw",
+        action="store_false",
+        default=True,
+        help=(
+            "by default, real mineable/harvestable map resources already stop "
+            "expansion without needing --stop-items — pass this to see the full "
+            "expansion for those too"
+        ),
     )
     p_expand.add_argument(
         "--recipe",

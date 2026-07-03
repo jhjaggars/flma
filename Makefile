@@ -49,6 +49,9 @@ clean: ## Clean up generated files
 run: ## Run MCP server locally (for dev/testing)
 	uv run python -m src.server
 
+trace-ui: ## View agent-eval MLflow traces (tests/agent_eval/mlruns) in the real MLflow UI, via uvx (no project deps added)
+	MLFLOW_ALLOW_FILE_STORE=true uvx --from mlflow mlflow ui --backend-store-uri file:./tests/agent_eval/mlruns --port 5001
+
 mod-zip: ## Zip the flma mod for local install (~/.factorio/mods) or the mod portal
 	@VERSION=$$(python3 -c "import json; print(json.load(open('mod/info.json'))['version'])"); \
 	rm -rf /tmp/flma_$$VERSION flma_$$VERSION.zip; \

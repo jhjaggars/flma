@@ -592,31 +592,30 @@ async def cmd_expand(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-async def cmd_recipe(args: argparse.Namespace) -> int:
-    engine = _make_engine()
-    if engine is None:
-        return 1
+async def _print_one_recipe(engine: ModuleType, name: str) -> bool:
+    """Print full detail for one recipe. Returns False (having already
+    printed the reason) if `name` didn't resolve to exactly one recipe."""
     db = engine.db
-    row = await db.fetch_one("SELECT * FROM recipes WHERE name = ?", (args.name,))
+    row = await db.fetch_one("SELECT * FROM recipes WHERE name = ?", (name,))
     if row is None:
         row = await db.fetch_one(
-            "SELECT * FROM recipes WHERE translated_name = ? COLLATE NOCASE", (args.name,)
+            "SELECT * FROM recipes WHERE translated_name = ? COLLATE NOCASE", (name,)
         )
     if row is None:
         candidates = await db.fetch_all(
             """SELECT name, translated_name FROM recipes
                WHERE name LIKE ? COLLATE NOCASE OR translated_name LIKE ? COLLATE NOCASE
                ORDER BY translated_name COLLATE NOCASE LIMIT 10""",
-            (f"%{args.name}%", f"%{args.name}%"),
+            (f"%{name}%", f"%{name}%"),
         )
         if not candidates:
-            print(f"no recipe found matching '{args.name}'.")
-            return 1
+            print(f"no recipe found matching '{name}'.")
+            return False
         if len(candidates) > 1:
-            print(f"'{args.name}' is ambiguous — candidates:")
+            print(f"'{name}' is ambiguous — candidates:")
             for c in candidates:
                 print(f"  {c['name']:<30} {c['translated_name']}")
-            return 1
+            return False
         row = await db.fetch_one("SELECT * FROM recipes WHERE name = ?", (candidates[0]["name"],))
 
     ingredients = await db.fetch_all(
@@ -638,6 +637,7 @@ async def cmd_recipe(args: argparse.Namespace) -> int:
     for i in ingredients:
         print(f"    {_fmt_num(i['amount'])}x {i['item_name']}")
     print("  products:")
+    craft_time = row["energy"]
     for p in products:
         amt = (
             _fmt_num(p["amount"])
@@ -645,8 +645,31 @@ async def cmd_recipe(args: argparse.Namespace) -> int:
             else f"{p['amount_min']}-{p['amount_max']}"
         )
         prob = f" @ {p['probability'] * 100:.0f}%" if p["probability"] not in (None, 1.0) else ""
-        print(f"    {amt}x {p['item_name']}{prob}")
-    return 0
+        # `amount`x is per craft, not per second — spelling out the actual
+        # per-machine rate here heads off reading the per-craft batch size
+        # as a --rate value (a craft-time-blind mistake this eval caught).
+        rate = ""
+        if p["amount"] is not None and craft_time:
+            per_sec = (
+                p["amount"]
+                * (p["probability"] if p["probability"] is not None else 1.0)
+                / craft_time
+            )
+            rate = f"  ({_fmt_num(per_sec)}/s per machine)"
+        print(f"    {amt}x {p['item_name']}{prob}{rate}")
+    return True
+
+
+async def cmd_recipe(args: argparse.Namespace) -> int:
+    engine = _make_engine()
+    if engine is None:
+        return 1
+    ok = True
+    for i, name in enumerate(args.name):
+        if i > 0:
+            print("---")
+        ok = await _print_one_recipe(engine, name) and ok
+    return 0 if ok else 1
 
 
 async def cmd_producers(args: argparse.Namespace) -> int:
@@ -806,8 +829,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="comma-separated ITEM=RECIPE overrides forcing a specific recipe per item",
     )
 
-    p_recipe = sub.add_parser("recipe", help="full detail for one recipe")
-    p_recipe.add_argument("name", help="recipe id or human name")
+    p_recipe = sub.add_parser("recipe", help="full detail for one or more recipes")
+    p_recipe.add_argument("name", nargs="+", help="recipe id(s) or human name(s)")
 
     p_producers = sub.add_parser("producers", help="what recipes produce this item (exact id)")
     p_producers.add_argument("item")

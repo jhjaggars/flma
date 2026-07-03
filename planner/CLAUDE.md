@@ -25,6 +25,7 @@ uv run python -m planner status                          # health check (also th
 uv run python -m planner plan "processing unit" --rate 10 # rate is items/sec by default
 uv run python -m planner plan sand --recipe sand=gravel-to-sand # force a specific recipe when the auto-pick is wrong
 uv run python -m planner have iron-plate                  # what am I already producing/storing?
+uv run python -m planner recipe sand-01 sand-02 sand-03    # compare several recipes in one call
 ```
 
 Config: `RECIPE_MCP_DIR` (default `~/code/homelab/apps/recipe-mcp`),

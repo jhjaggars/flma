@@ -41,6 +41,16 @@ def _fmt_num(n: float) -> str:
     return f"{n:.2f}"
 
 
+def _rate_hint(amount: float | None, probability: float | None, craft_time: float | None) -> str:
+    """`amount`x is per craft, not per second — appending the actual
+    per-machine rate heads off reading the per-craft batch size as a --rate
+    value (a craft-time-blind mistake this eval caught)."""
+    if amount is None or not craft_time:
+        return ""
+    per_sec = amount * (probability if probability is not None else 1.0) / craft_time
+    return f"  ({_fmt_num(per_sec)}/s per machine)"
+
+
 def _parse_recipe_overrides(raw: str | None) -> dict[str, str]:
     """Parse --recipe's `item=recipe[,item2=recipe2,...]` into a dict."""
     if not raw:
@@ -645,17 +655,7 @@ async def _print_one_recipe(engine: ModuleType, name: str) -> bool:
             else f"{p['amount_min']}-{p['amount_max']}"
         )
         prob = f" @ {p['probability'] * 100:.0f}%" if p["probability"] not in (None, 1.0) else ""
-        # `amount`x is per craft, not per second — spelling out the actual
-        # per-machine rate here heads off reading the per-craft batch size
-        # as a --rate value (a craft-time-blind mistake this eval caught).
-        rate = ""
-        if p["amount"] is not None and craft_time:
-            per_sec = (
-                p["amount"]
-                * (p["probability"] if p["probability"] is not None else 1.0)
-                / craft_time
-            )
-            rate = f"  ({_fmt_num(per_sec)}/s per machine)"
+        rate = _rate_hint(p["amount"], p["probability"], craft_time)
         print(f"    {amt}x {p['item_name']}{prob}{rate}")
     return True
 
@@ -677,7 +677,8 @@ async def cmd_producers(args: argparse.Namespace) -> int:
     if engine is None:
         return 1
     rows = await engine.db.fetch_all(
-        """SELECT r.name, r.category, r.enabled, r.main_product, p.amount, p.amount_min, p.amount_max
+        """SELECT r.name, r.category, r.enabled, r.main_product, r.energy,
+                  p.amount, p.amount_min, p.amount_max, p.probability
            FROM recipe_products p JOIN recipes r ON r.name = p.recipe_name
            WHERE p.item_name = ? ORDER BY r.enabled DESC, r.translated_name COLLATE NOCASE""",
         (args.item,),
@@ -700,7 +701,8 @@ async def cmd_producers(args: argparse.Namespace) -> int:
         # auto-picker in `plan`/`expand` now prefers these (see engine.py's
         # _pick_producer Tier 1.5).
         main = "  [main product]" if r["main_product"] == args.item else ""
-        print(f"  {r['name']:<32} {amt}x  ({r['category']}){flag}{main}")
+        rate = _rate_hint(r["amount"], r["probability"], r["energy"])
+        print(f"  {r['name']:<32} {amt}x  ({r['category']}){rate}{flag}{main}")
     return 0
 
 

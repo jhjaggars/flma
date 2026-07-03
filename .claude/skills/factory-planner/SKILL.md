@@ -31,7 +31,7 @@ From this repo's root:
 
 ```bash
 uv run python -m planner status                              # health check (also the no-args default)
-uv run python -m planner plan "processing unit" --rate 10     # rate defaults to items/sec
+uv run python -m planner plan "processing unit" --rate 10     # rate is items/sec; --rate itself defaults to 1 if omitted
 uv run python -m planner plan iron-plate --rate 2 --stop-items iron-ore
 uv run python -m planner plan sand --rate 1 --recipe sand=gravel-to-sand  # force a specific recipe
 uv run python -m planner expand iron-plate --rate 2 --stop-items iron-ore
@@ -49,6 +49,13 @@ add `--full` when something in it looks wrong and you need the per-row
 breakdown to see why.
 
 ## Common workflows
+
+**No target rate given ("a basic setup for X", "how would I make X").**
+Don't invent a number — `--rate` defaults to `1` (items/sec) when omitted,
+so just run `plan <product>` with no `--rate` flag at all and say you're
+using the default. Machine counts scale linearly with whatever rate you
+pick, so a made-up rate produces a made-up (and unflagged) machine count —
+ask the user for a target if the "basic" scale actually matters to them.
 
 **"Design a line for X at rate Y."** Run `plan <product> --rate <n>`. Read
 the `machines`/`raw inputs`/`drills` sections back to the user directly —

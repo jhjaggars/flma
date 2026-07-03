@@ -19,6 +19,25 @@ def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
+def write_ndjson(path: Path, events: list[dict]) -> None:
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+
+
+def _add_event(entity_id: int, name: str, force: str = "player") -> dict:
+    return {
+        "t": entity_id,
+        "op": "add",
+        "entity": {
+            "id": entity_id,
+            "name": name,
+            "type": "mining-drill",
+            "surface": "nauvis",
+            "position": {"x": 0.0, "y": 0.0},
+            "force": force,
+        },
+    }
+
+
 def _production_with_rates(surface_items: dict, surface_fluids: dict | None = None) -> dict:
     return {
         "tick": 1,
@@ -126,3 +145,35 @@ class TestNetProduction:
         gs = GameState(tmp_path, min_refresh_interval=0)
         net = live_state.net_production(gs)
         assert net["iron-plate"] == pytest.approx(15.0)
+
+
+class TestBuildingCounts:
+    def test_counts_by_name_for_force(self, tmp_path: Path) -> None:
+        write_ndjson(
+            tmp_path / "buildings.ndjson",
+            [
+                _add_event(1, "jaw-crusher"),
+                _add_event(2, "jaw-crusher"),
+                _add_event(3, "stone-furnace", force="enemy"),
+            ],
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        counts = live_state.building_counts(gs, force="player")
+        assert counts == {"jaw-crusher": 2}
+
+    def test_removed_entity_excluded(self, tmp_path: Path) -> None:
+        write_ndjson(
+            tmp_path / "buildings.ndjson",
+            [
+                _add_event(1, "jaw-crusher"),
+                {"t": 2, "op": "remove", "id": 1},
+            ],
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        counts = live_state.building_counts(gs, force="player")
+        assert counts == {}
+
+    def test_no_buildings_file_returns_empty(self, tmp_path: Path) -> None:
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        counts = live_state.building_counts(gs, force="player")
+        assert counts == {}

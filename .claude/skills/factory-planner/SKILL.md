@@ -7,19 +7,11 @@ description: Design Factorio production lines (machine counts, raw inputs, belt 
 
 ## Purpose
 
-Answers "I want to make N/sec of some product — how many machines do I need,
-what raw inputs do I have to bring in, how many belts, and what am I already
-producing that I could tap into instead of building new?" without an MCP
-server or Hermes — a local CLI (`planner/`) invoked directly.
-
-This exists because the arithmetic involved (recipe-chain expansion, batches
-→ machine counts, raw-input rollup) should be **baked into deterministic
-code, not generated on the fly in conversation**. The heavy math is not new
-code: it's `recipe-mcp`'s existing, tested `engine.plan_product` /
-`engine._expand_node` (in `~/code/homelab/apps/recipe-mcp/src/engine.py`),
-imported directly — no HTTP, no MCP protocol, just a plain async function
-call. `planner/` only adds what didn't already exist: live-state netting,
-belt/pipe counts, and the CLI itself.
+Answers "I want to make N/sec of some product — how many machines, what raw
+inputs, how many belts, and what am I already producing toward it?" via a
+local CLI (`planner/`) — no MCP server, no Hermes, no hand-computed
+recipe-chain math (that's baked into `recipe-mcp`'s tested engine, called
+directly).
 
 ## When to use this skill
 
@@ -41,6 +33,7 @@ From this repo's root:
 uv run python -m planner status                              # health check (also the no-args default)
 uv run python -m planner plan "processing unit" --rate 10     # rate defaults to items/sec
 uv run python -m planner plan iron-plate --rate 2 --stop-items iron-ore
+uv run python -m planner plan sand --rate 1 --recipe sand=gravel-to-sand  # force a specific recipe
 uv run python -m planner expand iron-plate --rate 2 --stop-items iron-ore
 uv run python -m planner recipe electronic-circuit
 uv run python -m planner producers iron-ore
@@ -50,7 +43,10 @@ uv run python -m planner have iron-plate
 
 `uv run flma-planner ...` (the installed console script) works identically.
 Every subcommand exits non-zero on error/ambiguity and prints candidates or a
-next-step hint rather than a bare stack trace or empty output.
+next-step hint rather than a bare stack trace or empty output. `plan`
+defaults to a one-line-per-section summary (same data, cheaper to read) —
+add `--full` when something in it looks wrong and you need the per-row
+breakdown to see why.
 
 ## Common workflows
 
@@ -65,6 +61,14 @@ ingredient chain (e.g. asking for iron-plate and getting acetone/propene).
 production + buffered-stock check, or look at the "already have" annotations
 `plan` prints next to each raw input.
 
+**Before treating a plan's raw inputs as all-new-build.** `plan` also prints
+"existing production" (intermediate items in the chain, not just flattened
+raw inputs) and "existing buildings" (live counts of machine types the plan
+calls for) whenever nonzero — read it and **ask the user** which reuse
+opportunities to apply before recommending new capacity. The tool
+deliberately doesn't net these out itself (duty cycle, backlog, and whether
+capacity is already spoken for are judgment calls).
+
 **"What's the full ingredient tree, not just the summary?"** Run `expand
 <product> --rate <n>` for the nested BOM instead of `plan`'s flattened
 machine bill.
@@ -77,73 +81,39 @@ prompts).
 
 ## Known caveats (don't let these surprise you mid-conversation)
 
-1. **Modpack alignment.** The committed recipe dump
-   (`~/code/homelab/apps/recipe-mcp/recipes.json` → `recipes.db`) is a
-   **Pyanodons** dump. The live game may be running a different modpack
-   entirely (verified: this machine's dev-server save is **Space Age**,
-   which shares almost no non-vanilla content with Pyanodons despite a
-   deceptively high raw tech-id overlap from the shared vanilla core — see
-   `planner/live_state.py:modpack_alignment`'s docstring for why a naive
-   overlap ratio is the wrong metric and Jaccard similarity is used
-   instead). When they don't match, `plan`/`have` still run, but live
-   tech-scoping and production-netting are skipped/empty rather than silently
-   wrong — `status` reports this plainly. **The fix**: as of flma mod 0.3.0
-   the mod exports its own RecipeExporter-compatible dump from the running
-   game (`~/.factorio/script-output/flma/recipes.json`, see `SCHEMA.md`), so
-   rebuild the DB from that and alignment is guaranteed:
-   `cd $RECIPE_MCP_DIR && uv run python -m src.build_db
-   ~/.factorio/script-output/flma/recipes.json recipes.db` (or build to a
-   separate path and point `RECIPES_DB` at it).
-2. **Recipe selection can pick a surprising alternate.** Pyanodons has
-   synthetic/alternate recipes for many things that would normally be raw
-   (e.g. ores producible from biomass byproduct chains). The engine's
-   producer-selection heuristic (first enabled, alphabetically, absent a
-   direct name match — see `engine._pick_producer`) can pick one of these
-   over the "obvious" recipe, expanding rate calculations through a long
-   unrelated chain instead of stopping at the raw resource. Tech-level
-   filtering (caveat below) narrows this since a tech-locked alternate can no
-   longer win, but doesn't eliminate it — two recipes can both be currently
-   buildable and still pick the "wrong" one. Use `--stop-items
-   <comma-separated ids>` on `plan`/`expand` to pin known raw inputs (ores,
-   basic raw resources) and short-circuit this. If a plan's `raw_inputs`
-   look wrong, run `expand` on the same product to see which recipe chain
-   was actually selected.
-3. **`plan`/`expand` filter by your actual research, live.** When the
-   modpack is aligned (see caveat 1), both commands pass the save's
-   currently-researched tech ids into the engine (`assume_researched`) and
-   turn on `only_enabled` — so recipe selection, crafting-machine choice,
-   *and* mining-drill choice all skip anything whose build recipe needs
-   research you haven't completed, picking the fastest option you can
-   actually build instead. A recipe/drill that's the only producer for an
-   item but is tech-locked makes that item fall back to a raw input, printed
-   under `tech-locked (falling back to raw input ...)` naming the missing
-   research; a tech-locked drill for an item that *does* have an eligible
-   drill appears under `blocked drills`, so upgrade paths (e.g. "researching
-   Mining machines - Stage 3 gets you a faster drill") stay visible instead
-   of silently vanishing. Note the DB's own `technologies.researched` /
-   `recipes.enabled` snapshot columns are close to useless for this (the
-   committed `recipes.db` was built at/near game start, so almost everything
-   reads unresearched) — the live tech ids from `tech.json` are what actually
-   drive this, which is why it's gated on modpack alignment.
-4. **Mining can have more than one extraction path.** Pyanodons resources are
-   often mineable multiple ways (e.g. ore-tin as a steam-fed
-   `basic-with-fluid` patch via a Fluid mining drill, or as fluid-free
-   `tin-rock` via a dedicated Tin mine) — `plan`'s `drills` section lists
-   every *currently-buildable* path (see caveat 3), tagged with
-   `[resource_category]` when more than one remains eligible. Required-fluid
-   consumption (e.g. Steam) for fluid-fed patches is shown inline
-   (`+N <fluid>/min`) but is **not** folded into the main `raw inputs` total,
-   since which path is actually built is a per-base decision — check the
-   `drills` section for the real fluid cost of whichever path you use.
-5. **Belt/pipe throughput is a placeholder.** Neither `recipes.json` nor the
-   DB contains belt-speed or pipe-throughput data (confirmed absent from the
-   RecipeExporter dump). `planner/throughput.py` hardcodes base/Space-Age
-   belt tiers and a rough pipe figure; Pyanodons' actual belt tiers and its
-   `py-transport-belt-capacity-N` research multipliers aren't filled in yet.
-   Treat belt counts as order-of-magnitude, not exact, until that module is
-   updated — it's flagged in `plan`/`status` output too.
-6. **Drill/raw estimates ignore modules, productivity, and ore purity** — the
-   engine already labels these `approximate`; don't present them as exact.
+1. **Modpack alignment.** The committed recipe dump defaults to Pyanodons;
+   the live save may run a different modpack. `status` reports whether they
+   match — when they don't, `plan`/`have` still run but tech-scoping/netting
+   are skipped rather than silently wrong. Fix: rebuild the DB from the
+   mod's own live export — `cd $RECIPE_MCP_DIR && uv run python -m
+   src.build_db ~/.factorio/script-output/flma/recipes.json recipes.db`.
+2. **Recipe auto-pick can still be a surprising tie.** The picker prefers a
+   recipe whose `main_product` is the item you asked for (fixes low-probability
+   byproduct recipes winning by alphabetical accident), but when *multiple*
+   recipes legitimately have the item as their main product, it's still
+   alphabetical among them — not necessarily the cheapest chain. If
+   `raw_inputs` look wrong or needlessly expensive: `expand` to see the
+   actual chain, `producers <item>` to see candidates (tagged `[main
+   product]`), `--recipe item=recipe_id` to force one (comma-separated for
+   multiple).
+3. **`plan`/`expand` filter by your actual research, live** (when aligned) —
+   a tech-locked-only producer falls back to a raw input
+   (`tech-locked (falling back to raw input ...)` note); a tech-locked drill
+   for an item with another eligible drill shows under `blocked drills`
+   instead of vanishing. The DB's own `enabled`/`researched` columns are
+   stale (built near game start) — live `tech.json` drives this instead.
+4. **Mining can have more than one extraction path** — `drills` lists every
+   currently-buildable one (tagged `[resource_category]` when >1), including
+   fluid raw inputs (e.g. geothermal-water → Geothermal plant). Required-fluid
+   cost for fluid-fed patches is shown inline, not folded into `raw inputs`.
+5. **Belt/pipe throughput is a placeholder** (no throughput data in the
+   RecipeExporter dump) — treat belt counts as order-of-magnitude.
+6. **Drill/raw estimates ignore modules, productivity, and ore purity.**
+7. **Offshore-pump-style "free" fluids (`water`, `pressured-water`) aren't in
+   the recipe DB at all** — no resource-patch row, no drill. The engine can
+   invent a weird synthetic chain to "produce" one instead (e.g. a fake
+   soil/mud cycle). If you know it's free/pumped in your game, pass it via
+   `--stop-items`.
 
 ## Configuration
 
@@ -159,17 +129,6 @@ Two env vars (both optional, sensible defaults):
 `SCRIPT_OUTPUT_DIR` (flma's own existing env var) controls where live
 snapshots are read from, same as the MCP bridge.
 
-## Architecture notes (only if something needs debugging)
-
-- `planner/_recipe_mcp_loader.py` imports recipe-mcp's `src/engine.py` under
-  the alias `recipe_mcp_src` (via `importlib`) rather than a normal
-  `import src.engine` — both projects name their package `src`, so a plain
-  import would silently resolve to whichever one Python already cached.
-- `planner/live_state.py` computes net production (output − input, summed
-  across surfaces) and buffered logistics stock — this math doesn't exist
-  anywhere else; `src/server.py`'s `get_production_stats` only passes the
-  raw per-surface counts through untouched.
-- `engine.py` in recipe-mcp was extracted from `server.py` specifically so
-  both the MCP server and this CLI call the *same* calculation code — see
-  that repo's `server.py` module docstring and `plan_factory`'s thin-wrapper
-  body for how they stay in sync.
+Debugging internals (import-aliasing trick, where the netting math lives,
+how the CLI and MCP server share engine code) live in `planner/CLAUDE.md`,
+not here — not needed for normal use of this skill.

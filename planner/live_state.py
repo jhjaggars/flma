@@ -85,6 +85,25 @@ def buffered_stock(gs: GameState, force: str = "player") -> dict[str, int]:
     return totals
 
 
+def building_counts(gs: GameState, force: str = "player") -> dict[str, int]:
+    """Placed-building counts by internal entity name, for `force`, from
+    `buildings.ndjson` (see `../SCHEMA.md`). Mirrors `src/server.py`'s
+    `get_building_counts` `by_name` grouping — kept independent rather than
+    imported, since this module derives everything straight from `GameState`
+    with no MCP server involved (same rationale as `net_production`/
+    `buffered_stock` re-deriving their own math instead of calling
+    `src/server.py`'s tool functions)."""
+    counts: dict[str, int] = {}
+    for b in gs.get_buildings():
+        if b.get("force") != force:
+            continue
+        name = b.get("name")
+        if name is None:
+            continue
+        counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
 def modpack_alignment(
     gs: GameState, db_tech_ids: set[str], force: str = "player"
 ) -> dict[str, Any]:

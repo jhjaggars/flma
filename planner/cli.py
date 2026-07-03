@@ -41,6 +41,25 @@ def _fmt_num(n: float) -> str:
     return f"{n:.2f}"
 
 
+def _parse_recipe_overrides(raw: str | None) -> dict[str, str]:
+    """Parse --recipe's `item=recipe[,item2=recipe2,...]` into a dict."""
+    if not raw:
+        return {}
+    overrides: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        item_id, sep, recipe_id = pair.partition("=")
+        if not sep:
+            print(
+                f"warning: --recipe entry '{pair}' must be ITEM=RECIPE, skipping", file=sys.stderr
+            )
+            continue
+        overrides[item_id.strip()] = recipe_id.strip()
+    return overrides
+
+
 def _make_engine() -> ModuleType | None:
     """Load recipe-mcp's engine module and point it at our recipes.db.
     Returns None (after printing an error) if the DB hasn't been built yet."""
@@ -105,6 +124,27 @@ def _print_ambiguous(query: str, candidates: list[dict]) -> int:
         print(f"  {item_id:<30} ({c.get('kind', '')})  {display}")
     print("\nnext: re-run with the exact id from the list above.")
     return 1
+
+
+def _is_tech_locked(item_id: str, tech_locked_notes: list[str]) -> bool:
+    """Whether `item_id` has a tech-locked selection note. Exact-prefix
+    match, not substring — notes read "{item_id}: ...", and a naive
+    substring check would false-match e.g. "water" inside a
+    "geothermal-water: ..." note."""
+    return any(n.startswith(f"{item_id}: ") for n in tech_locked_notes)
+
+
+def _collect_intermediate_ids(node: dict, out: set[str]) -> None:
+    """Walk an `_expand_node` tree collecting every non-leaf item id — the
+    intermediate products (chromite-sand, limestone, creosote, ...) that
+    `plan_product`'s flattened `raw_inputs` bill has no visibility into,
+    since they're fully consumed inside the chain rather than surfacing as
+    raw inputs."""
+    if node.get("leaf"):
+        return
+    out.add(node["id"])
+    for child in node.get("ingredients", []):
+        _collect_intermediate_ids(child, out)
 
 
 def _print_tree(node: dict, indent: int = 0) -> None:
@@ -176,36 +216,75 @@ async def cmd_status(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-async def cmd_plan(args: argparse.Namespace) -> int:
-    engine = _make_engine()
-    if engine is None:
-        return 1
-    gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
-    db_tech_ids = await _db_tech_ids(engine)
-    align = live_state.modpack_alignment(gs, db_tech_ids, force=args.force)
-
-    rate_per_min = args.rate * 60.0 if args.unit == "per-sec" else args.rate
-
-    scoping: dict = {}
-    if align["aligned"]:
-        scoping["assume_researched"] = live_state.researched_technologies(gs, force=args.force)
-        scoping["only_enabled"] = True
-
-    if args.stop_items:
-        scoping["stop_items"] = [s.strip() for s in args.stop_items.split(",") if s.strip()]
-
-    result = await engine.plan_product(
-        args.product, rate_per_min=rate_per_min, max_depth=args.max_depth, **scoping
+async def _plan_reuse_candidates(
+    engine: ModuleType,
+    args: argparse.Namespace,
+    gs: live_state.GameState,
+    align: dict,
+    scoping: dict,
+    recipe_overrides: dict[str, str],
+    rate_per_min: float,
+    result: dict,
+    net: dict[str, float],
+    stock: dict[str, int],
+) -> tuple[list[tuple[str, float | None, int]], list[tuple[str, int, int]]]:
+    """Existing production (for intermediate items in the chain, not just
+    the flattened raw_inputs) and existing buildings (live counts of machine
+    types the plan calls for) — reuse candidates to surface before
+    recommending fresh capacity. Empty when live state isn't aligned."""
+    if not align["aligned"]:
+        return [], []
+    row, _candidates = await _resolve_item(engine, args.product)
+    if row is None:
+        return [], []
+    extra_unlocked = await engine.unlocked_recipes_for_techs(scoping.get("assume_researched"))
+    tree = await engine._expand_node(
+        row["name"],
+        row["kind"],
+        rate_per_min,
+        depth=0,
+        max_depth=args.max_depth,
+        exclude_cats=engine._DEFAULT_EXCLUDE,
+        stop_cats=frozenset(),
+        stop_items=frozenset(scoping.get("stop_items", [])),
+        prefer_enabled=True,
+        overrides=recipe_overrides,
+        ancestors=frozenset(),
+        totals_items={},
+        totals_fluids={},
+        unresolved=[],
+        alternates_map={},
+        selection_notes=[],
+        extra_unlocked=extra_unlocked,
+        enforce_tech=bool(extra_unlocked),
     )
+    intermediate_ids: set[str] = set()
+    _collect_intermediate_ids(tree, intermediate_ids)
 
-    if "error" in result:
-        return _fail(result["error"])
-    if result.get("ambiguous"):
-        return _print_ambiguous(args.product, result["candidates"])
+    reuse_production = [
+        (iid, net.get(iid), stock.get(iid, 0))
+        for iid in sorted(intermediate_ids)
+        if (net.get(iid) not in (None, 0.0)) or stock.get(iid, 0)
+    ]
+    built = live_state.building_counts(gs, force=args.force)
+    reuse_buildings = [
+        (b["name"], built.get(b["id"], 0), b["count"])
+        for b in result["buildings"]
+        if built.get(b["id"], 0) > 0
+    ]
+    return reuse_production, reuse_buildings
 
-    net = live_state.net_production(gs, force=args.force) if align["aligned"] else {}
-    stock = live_state.buffered_stock(gs, force=args.force) if align["aligned"] else {}
 
+def _print_plan_verbose(
+    args: argparse.Namespace,
+    result: dict,
+    align: dict,
+    net: dict[str, float],
+    stock: dict[str, int],
+    reuse_production: list[tuple[str, float | None, int]],
+    reuse_buildings: list[tuple[str, int, int]],
+    tech_locked_notes: list[str],
+) -> None:
     per_sec = result["rate_per_min"] / 60.0
     print(
         f"plan: {result['product']}  @ {_fmt_num(result['rate_per_min'])}/min ({_fmt_num(per_sec)}/s)"
@@ -251,11 +330,28 @@ async def cmd_plan(args: argparse.Namespace) -> int:
     if len(raw_inputs) > args.top:
         print(f"  ... {len(raw_inputs) - args.top} more (raise --top to see all)")
 
-    tech_locked_notes = [n for n in result.get("selection_notes", []) if "tech-locked" in n]
+    if reuse_production:
+        print(
+            "\nexisting production (possible reuse — not netted out, "
+            "check before building fresh capacity):"
+        )
+        for iid, n, s in reuse_production:
+            bits = []
+            if n:
+                bits.append(f"net {_fmt_num(n)}/min live")
+            if s:
+                bits.append(f"{s} buffered")
+            print(f"  {iid:<28} {', '.join(bits)}")
+
+    if reuse_buildings:
+        print("\nexisting buildings (possible reuse):")
+        for name, have, need in reuse_buildings:
+            print(f"  {name:<32} {have} built, plan calls for {need}")
+
     if tech_locked_notes:
         print("\ntech-locked (falling back to raw input at your current research level):")
-        for n in tech_locked_notes:
-            print(f"  {n}")
+        for note in tech_locked_notes:
+            print(f"  {note}")
 
     if result["drills"]:
         print("\ndrills (approximate — ignores purity/productivity bonuses):")
@@ -296,6 +392,123 @@ async def cmd_plan(args: argparse.Namespace) -> int:
         f"\nnext: `expand {result['product']} --rate {args.rate} --unit {args.unit}` "
         f"for the full BOM tree; `have <item>` to check current production of a specific input."
     )
+
+
+def _print_plan_compact(
+    args: argparse.Namespace,
+    result: dict,
+    align: dict,
+    net: dict[str, float],
+    reuse_production: list[tuple[str, float | None, int]],
+    reuse_buildings: list[tuple[str, int, int]],
+    tech_locked_notes: list[str],
+) -> None:
+    """One line per section instead of one line per item — same underlying
+    data as the verbose output, for a consumer (typically an agent) that
+    just needs the headline numbers, not a full read-every-row report."""
+    per_sec = result["rate_per_min"] / 60.0
+    print(
+        f"plan: {result['product']} @ {_fmt_num(result['rate_per_min'])}/min ({_fmt_num(per_sec)}/s)"
+    )
+    if not align["aligned"]:
+        print("(unaligned modpack — tech-scoping/netting skipped, see `status`)")
+
+    machines = ", ".join(f"{b['count']}x {b['name']}" for b in result["buildings"]) or "(none)"
+    print(f"machines: {machines}")
+
+    raw_inputs = result["raw_inputs"]
+
+    def _raw_str(r: dict) -> str:
+        tag = " [tech-locked]" if _is_tech_locked(r["id"], tech_locked_notes) else ""
+        return f"{r['id']} {_fmt_num(r['amount_per_min'])}/min{tag}"
+
+    raw = ", ".join(_raw_str(r) for r in raw_inputs) or "(none)"
+    print(f"raw inputs: {raw}")
+
+    if reuse_production:
+        prod = ", ".join(f"{iid}({_fmt_num(n or 0)}/min live)" for iid, n, _s in reuse_production)
+        print(f"reuse candidates (production): {prod}")
+    if reuse_buildings:
+        bld = ", ".join(
+            f"{name}({have} built/{need} needed)" for name, have, need in reuse_buildings
+        )
+        print(f"reuse candidates (buildings): {bld}")
+
+    if result["drills"]:
+        drills = ", ".join(
+            f"{d['drill_count']}x {d['drill_name']}({d['resource']})" for d in result["drills"]
+        )
+        print(f"drills: {drills}")
+
+    flags = []
+    if tech_locked_notes:
+        flags.append(f"tech-locked={len(tech_locked_notes)}")
+    if result.get("blocked_drills"):
+        flags.append(f"blocked-drills={len(result['blocked_drills'])}")
+    if result["blocked_categories"]:
+        flags.append(f"blocked-categories={len(result['blocked_categories'])}")
+    if not throughput.VALUES_ARE_PYANODONS_ACCURATE:
+        flags.append("belts=approximate")
+    if flags:
+        print(f"flags: {', '.join(flags)}")
+    print(
+        f"(add --full for the per-row breakdown, or run `expand {result['product']}`, "
+        "for detail/reasoning behind any of the above)"
+    )
+
+
+async def cmd_plan(args: argparse.Namespace) -> int:
+    engine = _make_engine()
+    if engine is None:
+        return 1
+    gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
+    db_tech_ids = await _db_tech_ids(engine)
+    align = live_state.modpack_alignment(gs, db_tech_ids, force=args.force)
+
+    rate_per_min = args.rate * 60.0 if args.unit == "per-sec" else args.rate
+
+    scoping: dict = {}
+    if align["aligned"]:
+        scoping["assume_researched"] = live_state.researched_technologies(gs, force=args.force)
+        scoping["only_enabled"] = True
+
+    if args.stop_items:
+        scoping["stop_items"] = [s.strip() for s in args.stop_items.split(",") if s.strip()]
+
+    recipe_overrides = _parse_recipe_overrides(args.recipe)
+    if recipe_overrides:
+        scoping["recipe_overrides"] = recipe_overrides
+
+    result = await engine.plan_product(
+        args.product, rate_per_min=rate_per_min, max_depth=args.max_depth, **scoping
+    )
+
+    if "error" in result:
+        return _fail(result["error"])
+    if result.get("ambiguous"):
+        return _print_ambiguous(args.product, result["candidates"])
+
+    net = live_state.net_production(gs, force=args.force) if align["aligned"] else {}
+    stock = live_state.buffered_stock(gs, force=args.force) if align["aligned"] else {}
+
+    # Surface existing production/buildings toward this plan rather than
+    # silently assuming everything needs to be built from scratch — deciding
+    # whether existing capacity actually covers the need (duty cycle,
+    # backlog, whether it's earmarked for something else already) stays a
+    # human call; this just makes the comparison visible.
+    reuse_production, reuse_buildings = await _plan_reuse_candidates(
+        engine, args, gs, align, scoping, recipe_overrides, rate_per_min, result, net, stock
+    )
+    tech_locked_notes = [n for n in result.get("selection_notes", []) if "tech-locked" in n]
+
+    if args.full:
+        _print_plan_verbose(
+            args, result, align, net, stock, reuse_production, reuse_buildings, tech_locked_notes
+        )
+    else:
+        _print_plan_compact(
+            args, result, align, net, reuse_production, reuse_buildings, tech_locked_notes
+        )
     return 0
 
 
@@ -339,7 +552,7 @@ async def cmd_expand(args: argparse.Namespace) -> int:
         stop_cats=frozenset(),
         stop_items=stop_items,
         prefer_enabled=True,
-        overrides={},
+        overrides=_parse_recipe_overrides(args.recipe),
         ancestors=frozenset(),
         totals_items=totals_items,
         totals_fluids=totals_fluids,
@@ -419,6 +632,7 @@ async def cmd_recipe(args: argparse.Namespace) -> int:
     print(f"{row['name']}  ({row['translated_name']})")
     print(
         f"  category: {row['category']}   craft time: {row['energy']}s   enabled: {bool(row['enabled'])}"
+        f"   main product: {row['main_product'] or '(none)'}"
     )
     print("  ingredients:")
     for i in ingredients:
@@ -440,7 +654,7 @@ async def cmd_producers(args: argparse.Namespace) -> int:
     if engine is None:
         return 1
     rows = await engine.db.fetch_all(
-        """SELECT r.name, r.category, r.enabled, p.amount, p.amount_min, p.amount_max
+        """SELECT r.name, r.category, r.enabled, r.main_product, p.amount, p.amount_min, p.amount_max
            FROM recipe_products p JOIN recipes r ON r.name = p.recipe_name
            WHERE p.item_name = ? ORDER BY r.enabled DESC, r.translated_name COLLATE NOCASE""",
         (args.item,),
@@ -458,7 +672,12 @@ async def cmd_producers(args: argparse.Namespace) -> int:
             else f"{r['amount_min']}-{r['amount_max']}"
         )
         flag = "" if r["enabled"] else "  [disabled]"
-        print(f"  {r['name']:<32} {amt}x  ({r['category']}){flag}")
+        # main_product == item_id means this is the recipe's actual purpose,
+        # not a probabilistic/secondary byproduct of something else — the
+        # auto-picker in `plan`/`expand` now prefers these (see engine.py's
+        # _pick_producer Tier 1.5).
+        main = "  [main product]" if r["main_product"] == args.item else ""
+        print(f"  {r['name']:<32} {amt}x  ({r['category']}){flag}{main}")
     return 0
 
 
@@ -547,6 +766,25 @@ def build_parser() -> argparse.ArgumentParser:
             "plan's raw_inputs look wrong to sanity-check the chosen recipe chain."
         ),
     )
+    p_plan.add_argument(
+        "--recipe",
+        default=None,
+        help=(
+            "comma-separated ITEM=RECIPE overrides forcing a specific recipe per item "
+            "(e.g. sand=gravel-to-sand). Use `producers <item>` to see candidates — "
+            "rows tagged [main product] are usually the one you want; the auto-picker "
+            "already prefers those, so this is for the remaining surprises."
+        ),
+    )
+    p_plan.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "full per-row breakdown (one line per machine/raw input/etc.) instead of the "
+            "default one-line-per-section summary — use when something in the compact "
+            "output looks wrong and you need the detail behind it"
+        ),
+    )
 
     p_expand = sub.add_parser("expand", help="full bill-of-materials tree for a product")
     p_expand.add_argument("product", help="item/fluid id or human name")
@@ -561,6 +799,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--stop-items",
         default=None,
         help="comma-separated item ids to treat as raw and stop expanding (e.g. iron-ore,copper-ore)",
+    )
+    p_expand.add_argument(
+        "--recipe",
+        default=None,
+        help="comma-separated ITEM=RECIPE overrides forcing a specific recipe per item",
     )
 
     p_recipe = sub.add_parser("recipe", help="full detail for one recipe")

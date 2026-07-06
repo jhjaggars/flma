@@ -20,6 +20,13 @@ times — the stream doesn't carry reliable per-turn wall-clock timestamps to
 replay against. Order (the `turn` attribute) is preserved and is what
 actually matters for "what contributed to context," so this doesn't affect
 that; it does mean span durations in the UI aren't meaningful.
+
+Every trace is tagged with `model` and `task` (trace-level tags, filterable
+via `search_traces(filter_string=...)`, unlike span attributes) and the root
+span carries that run's total input/output tokens and cost — so results are
+comparable by model across every eval run ever logged, not just the one
+just-run batch. `python mlflow_trace.py [--task NAME]` prints that
+comparison; `summarize_by_model()` is the underlying function.
 """
 
 from __future__ import annotations
@@ -48,11 +55,15 @@ def _as_text(content: Any, limit: int = 2000) -> str:
 
 def log_trace(
     task_name: str,
+    model: str,
     prompt: str,
     events: list[dict[str, Any]],
     structured_result: dict[str, Any] | None,
     passed: bool,
     reason: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cost_usd: float = 0.0,
 ) -> str:
     """Replay one task's stream-json events into an MLflow trace. Returns
     the trace id."""
@@ -60,6 +71,7 @@ def log_trace(
         name=task_name,
         span_type="AGENT",
         inputs={"prompt": prompt},
+        attributes={"model": model},
     )
 
     # Pass 1: group assistant content blocks by message id (stream-json
@@ -121,10 +133,54 @@ def log_trace(
     root.set_attribute("num_turns", order)
     root.set_attribute("passed", passed)
     root.set_attribute("reason", reason)
+    root.set_attribute("input_tokens", input_tokens)
+    root.set_attribute("output_tokens", output_tokens)
+    root.set_attribute("cost_usd", cost_usd)
     root.set_outputs(structured_result)
     root.end()
+    # Trace-level tags (as opposed to span attributes) are what
+    # `mlflow.search_traces(filter_string=...)` can actually filter/group
+    # on — that's the mechanism for "compare model X vs Y over time".
+    client = mlflow.MlflowClient()
+    client.set_trace_tag(root.trace_id, "model", model)
+    client.set_trace_tag(root.trace_id, "task", task_name)
     mlflow.flush_trace_async_logging()
     return root.trace_id
+
+
+def summarize_by_model(task_name: str | None = None) -> None:
+    """Aggregate every logged trace by model (optionally scoped to one
+    task), across all past eval runs — the "compare over time" view."""
+    filter_string = f"tag.task = '{task_name}'" if task_name else None
+    traces = mlflow.search_traces(filter_string=filter_string, return_type="list")
+
+    by_model: dict[str, dict[str, Any]] = {}
+    for trace in traces:
+        model = trace.info.tags.get("model")
+        if model is None:
+            continue  # pre-tagging trace, no model recorded
+        root = next((s for s in trace.data.spans if s.parent_id is None), None)
+        if root is None:
+            continue
+        bucket = by_model.setdefault(
+            model, {"n": 0, "passed": 0, "in_tok": 0, "out_tok": 0, "cost": 0.0}
+        )
+        bucket["n"] += 1
+        bucket["passed"] += bool(root.attributes.get("passed"))
+        bucket["in_tok"] += root.attributes.get("input_tokens", 0)
+        bucket["out_tok"] += root.attributes.get("output_tokens", 0)
+        bucket["cost"] += root.attributes.get("cost_usd", 0.0)
+
+    if not by_model:
+        print("no tagged traces found" + (f" for task {task_name!r}" if task_name else ""))
+        return
+
+    print(f"{'model':<10} {'runs':>5} {'pass':>7} {'avg_tok':>9} {'avg_cost':>9}")
+    for model, b in sorted(by_model.items()):
+        avg_tok = (b["in_tok"] + b["out_tok"]) / b["n"]
+        avg_cost = b["cost"] / b["n"]
+        pass_str = f"{b['passed']}/{b['n']}"
+        print(f"{model:<10} {b['n']:>5} {pass_str:>7} {avg_tok:>9.0f} ${avg_cost:>8.3f}")
 
 
 def print_trace_summary(trace_id: str) -> None:
@@ -147,3 +203,14 @@ def print_trace_summary(trace_id: str) -> None:
             f"{attrs.get('cache_read_input_tokens', 0):>9} {attrs.get('output_tokens', 0):>7} "
             f"{attrs.get('result_chars', ''):>12}"
         )
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Compare eval results by model across all past runs"
+    )
+    parser.add_argument("--task", default=None, help="scope to one task name (default: all)")
+    args = parser.parse_args()
+    summarize_by_model(args.task)

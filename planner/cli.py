@@ -7,12 +7,15 @@ and what do I already have toward it" — without an MCP server or Hermes.
 
 Usage:
     uv run python -m planner.cli                         # status (default)
+    uv run python -m planner.cli options copper-plate    # viable ways to make X
     uv run python -m planner.cli plan "processing unit" --rate 10
     uv run python -m planner.cli expand iron-plate --rate 5
     uv run python -m planner.cli recipe electronic-circuit
     uv run python -m planner.cli producers iron-plate
     uv run python -m planner.cli consumers iron-plate
     uv run python -m planner.cli have iron-plate
+    uv run python -m planner.cli belts 2                 # belts -> achievable rate
+    uv run python -m planner.cli tech "Copper processing - Stage 1"  # what it unlocks & whether it combines
 
 See .claude/skills/factory-planner/SKILL.md for the workflows this backs, and
 CLAUDE.md's factory-planner section for the modpack-alignment caveat.
@@ -22,12 +25,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import sys
 from collections import Counter
 from types import ModuleType
 
-from planner import config, live_state, throughput
+from planner import config, live_state, techbundle, throughput
 from planner._recipe_mcp_loader import load_async_database_class, load_engine
+from planner.options import classify_producer, deeper_choices, tree_categories, tree_stages
+from planner.recommend import rank_candidates
 
 
 def _fail(message: str) -> int:
@@ -39,6 +45,49 @@ def _fmt_num(n: float) -> str:
     if abs(n - round(n)) < 1e-6:
         return str(int(round(n)))
     return f"{n:.2f}"
+
+
+_RATE_SUFFIXES: tuple[tuple[str, str], ...] = (
+    ("/second", "per-sec"),
+    ("/sec", "per-sec"),
+    ("/s", "per-sec"),
+    ("/minute", "per-min"),
+    ("/min", "per-min"),
+    ("/m", "per-min"),
+)
+
+
+def _parse_rate_per_min(raw: str, default_unit: str) -> float:
+    """Parse a --rate/--consume rate value into items/min. `raw` may carry
+    its own unit suffix (`15/s`, `900/min`, ...) that overrides
+    `default_unit` (the command's --unit flag) -- this exists because a bare
+    number's unit depends on a separate flag the caller can easily forget to
+    set (or a value pasted from this CLI's own `X/s = Y/min` output can't be
+    pasted back in as-is), so an explicit suffix should always win. Falls
+    back to `default_unit` when `raw` has no suffix, so old-style bare
+    numbers keep working unchanged. Raises ValueError (caller should catch
+    and report via `_fail`) on anything unparseable."""
+    text = raw.strip()
+    unit = default_unit
+    for suffix, canonical in _RATE_SUFFIXES:
+        if text.lower().endswith(suffix):
+            text = text[: -len(suffix)]
+            unit = canonical
+            break
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError(
+            f"rate must be a number, optionally suffixed with /s, /sec, or /min — got {raw!r}"
+        ) from None
+    return value * 60.0 if unit == "per-sec" else value
+
+
+def _rate_per_min_or_default(raw: str | None, unit: str, default: float = 60.0) -> float:
+    """`_parse_rate_per_min`, but returns `default` (60/min) when no --rate
+    was given at all -- the common `rate_per_min = 60.0 if args.rate is
+    None else ...` pattern shared by `options`/`tech`/`recommend`."""
+    return default if raw is None else _parse_rate_per_min(raw, unit)
 
 
 def _rate_hint(amount: float | None, probability: float | None, craft_time: float | None) -> str:
@@ -136,12 +185,210 @@ def _print_ambiguous(query: str, candidates: list[dict]) -> int:
     return 1
 
 
+async def _resolve_tech(engine: ModuleType, query: str) -> tuple[dict | None, list[dict]]:
+    """Resolve a technology id or human name — mirrors `_resolve_item` above,
+    but against the `technologies` table instead of `names`. Returns
+    (row, []) on a clean match, (None, candidates) when ambiguous/unmatched."""
+    db = engine.db
+    row = await db.fetch_one(
+        "SELECT name, translated_name FROM technologies WHERE name = ?", (query,)
+    )
+    if row is not None:
+        return row, []
+    row = await db.fetch_one(
+        "SELECT name, translated_name FROM technologies WHERE translated_name = ? COLLATE NOCASE",
+        (query,),
+    )
+    if row is not None:
+        return row, []
+    fuzzy = await db.fetch_all(
+        """SELECT name, translated_name FROM technologies
+           WHERE name LIKE ? COLLATE NOCASE OR translated_name LIKE ? COLLATE NOCASE
+           ORDER BY translated_name COLLATE NOCASE LIMIT 10""",
+        (f"%{query}%", f"%{query}%"),
+    )
+    if len(fuzzy) == 1:
+        return fuzzy[0], []
+    return None, fuzzy
+
+
+def _print_ambiguous_tech(query: str, candidates: list[dict]) -> int:
+    if not candidates:
+        print(f"no technology found matching '{query}'.")
+        return 1
+    print(f"'{query}' is ambiguous — candidates:")
+    for c in candidates:
+        print(f"  {c['name']:<32} {c['translated_name']}")
+    print("\nnext: re-run with the exact id/name from the list above.")
+    return 1
+
+
+async def _fastest_eligible_machine(
+    engine: ModuleType,
+    category: str,
+    *,
+    extra_unlocked: frozenset[str],
+    enforce_tech: bool,
+) -> dict | None:
+    """Fastest machine that can build recipes in `category`, tech-filtered
+    the same way `plan_product`'s own machine-count pass is — factored out of
+    `_one_machine_rate_per_min` so `options` can look up a category's fastest
+    machine without first picking a specific recipe (it needs this per
+    *candidate* recipe, not just the auto-picked one). Returns None if no
+    eligible machine exists."""
+    machine_rows = await engine.db.fetch_all(
+        """SELECT m.name, m.translated_name, m.crafting_speed
+           FROM machines m
+           JOIN machine_crafting_categories mcc ON mcc.machine_name = m.name
+           WHERE mcc.category = ?
+           ORDER BY m.crafting_speed DESC""",
+        (category,),
+    )
+    if enforce_tech:
+        eligible = []
+        for m in machine_rows:
+            ok, _missing = await engine._is_item_buildable(m["name"], extra_unlocked)
+            if ok:
+                eligible.append(m)
+        machine_rows = eligible
+    if not machine_rows:
+        return None
+    result: dict = machine_rows[0]
+    return result
+
+
+async def _fastest_buildable_belt_tier(
+    engine: ModuleType, extra_unlocked: frozenset[str]
+) -> str | None:
+    """Fastest belt tier (see throughput.BELT_THROUGHPUT_ITEMS_PER_SEC) that
+    both exists in this modpack's recipe DB and is currently buildable —
+    same tech-scoping `_fastest_eligible_machine` uses, applied to a fixed
+    list of belt item ids instead of a DB-driven machine query. Checks
+    `names` before trusting `_is_item_buildable`: that function treats "no
+    build recipe at all" as "always available" (correct for bare starter
+    entities), which would otherwise misreport a tier that doesn't exist in
+    this modpack at all (e.g. Space Age's turbo-transport-belt in a
+    Pyanodons DB) as buildable. Returns None if no known tier both exists
+    and is buildable, so the caller falls back to the static default."""
+    for tier_id, _speed in sorted(
+        throughput.BELT_THROUGHPUT_ITEMS_PER_SEC.items(), key=lambda kv: kv[1], reverse=True
+    ):
+        exists = await engine.db.fetch_one("SELECT 1 FROM names WHERE name = ?", (tier_id,))
+        if not exists:
+            continue
+        ok, _missing = await engine._is_item_buildable(tier_id, extra_unlocked)
+        if ok:
+            return tier_id
+    return None
+
+
+async def _one_machine_rate_per_min(
+    engine: ModuleType,
+    item_id: str,
+    *,
+    extra_unlocked: frozenset[str],
+    enforce_tech: bool,
+    overrides: dict[str, str],
+) -> tuple[float, dict] | None:
+    """Rate (items/min) produced by exactly one instance of the fastest
+    eligible machine for item_id's auto-picked recipe. This is what `--rate`
+    defaults to when omitted — "just build one" is the natural starting
+    point for a "basic setup" ask, whereas an arbitrary flat rate (e.g. the
+    old default of 1/s) can demand dozens of machines for a slow recipe
+    (Pyanodons fish farms: ~130 machines for 1 fish/sec) or round up to a
+    full machine for a recipe that's nearly idle at that rate — neither
+    reflects "one machine's worth". Returns None if no eligible
+    recipe/machine exists (caller falls back to erroring out with a
+    prompt to pass --rate explicitly)."""
+    chosen, _candidates, _notes, _reason = await engine._pick_producer(
+        item_id,
+        exclude_cats=engine._DEFAULT_EXCLUDE,
+        stop_cats=frozenset(),
+        prefer_enabled=True,
+        overrides=overrides,
+        extra_unlocked=extra_unlocked,
+        enforce_tech=enforce_tech,
+    )
+    if chosen is None:
+        return None
+    energy = float(chosen.get("energy") or 0.0)
+    if energy <= 0:
+        return None
+    eff_out = engine._effective_out(chosen)
+
+    machine = await _fastest_eligible_machine(
+        engine, chosen["category"], extra_unlocked=extra_unlocked, enforce_tech=enforce_tech
+    )
+    if machine is None:
+        return None
+    speed = float(machine["crafting_speed"]) or 1.0
+    # Shave a hair off the exact boundary so the machine-count math downstream
+    # (which does math.ceil(batches_per_min * energy / (60 * speed))) lands on
+    # exactly 1 machine instead of 2 from floating-point overshoot.
+    rate_per_min = eff_out / energy * speed * 60.0 * (1 - 1e-9)
+    return rate_per_min, {
+        "recipe": chosen["name"],
+        "category": chosen["category"],
+        "machine_id": machine["name"],
+        "machine_name": machine["translated_name"],
+        "speed": speed,
+    }
+
+
 def _is_tech_locked(item_id: str, tech_locked_notes: list[str]) -> bool:
     """Whether `item_id` has a tech-locked selection note. Exact-prefix
     match, not substring — notes read "{item_id}: ...", and a naive
     substring check would false-match e.g. "water" inside a
     "geothermal-water: ..." note."""
     return any(n.startswith(f"{item_id}: ") for n in tech_locked_notes)
+
+
+async def _tech_status_labels(
+    engine: ModuleType, rows: list[dict], extra_unlocked: frozenset[str], aligned: bool
+) -> dict[str, str]:
+    """Per-recipe-name live tech-scoped status tag for display, replacing the
+    DB's own static `enabled` snapshot (built at db-build time, not your
+    save's research progress) — the exact gap that once led an agent (and
+    me, earlier in this investigation) to reject the correct 'battery-mk01'
+    recipe as "[disabled]" and pick a worse alternate instead, since
+    `producers`/`recipe` never cross-referenced live research the way
+    `plan`/`expand` already do internally. '' for a recipe needing no
+    research at all; '[researched]' for one gated behind research you've
+    *already done*; '[needs: X, Y]' for one you haven't unlocked yet.
+    '[disabled, no tracked tech unlocks it]' is a distinct, worse case:
+    disabled with ZERO rows in technology_recipe_unlocks — not "research
+    something and it appears", just permanently disabled/orphaned as far as
+    the DB can tell (the exact trap 'battery' turned out to be: it looked
+    like a safe, ungated starter recipe for battery-mk01, but it's actually
+    just unavailable, full stop). Empty for every recipe when live
+    tech-scoping isn't available (unaligned modpack — same as `plan`/
+    `expand`'s own fallback)."""
+    if not aligned:
+        return {}
+    locked = [r["name"] for r in rows if not r["enabled"] and r["name"] not in extra_unlocked]
+    needs: dict[str, list[str]] = {}
+    if locked:
+        tech_rows = await engine.db.fetch_all(
+            f"""SELECT tru.recipe_name, t.translated_name FROM technology_recipe_unlocks tru
+                JOIN technologies t ON t.name = tru.tech_name
+                WHERE tru.recipe_name IN ({",".join("?" * len(locked))})""",
+            tuple(locked),
+        )
+        for trow in tech_rows:
+            needs.setdefault(trow["recipe_name"], []).append(trow["translated_name"])
+
+    labels: dict[str, str] = {}
+    for r in rows:
+        name = r["name"]
+        if r["enabled"]:
+            labels[name] = ""
+        elif name in extra_unlocked:
+            labels[name] = "  [researched]"
+        elif name in needs:
+            labels[name] = f"  [needs: {', '.join(sorted(needs[name]))}]"
+        else:
+            labels[name] = "  [disabled, no tracked tech unlocks it]"
+    return labels
 
 
 def _collect_intermediate_ids(node: dict, out: set[str]) -> None:
@@ -157,16 +404,38 @@ def _collect_intermediate_ids(node: dict, out: set[str]) -> None:
         _collect_intermediate_ids(child, out)
 
 
-def _print_tree(node: dict, indent: int = 0) -> None:
+def _print_tree(
+    node: dict,
+    indent: int = 0,
+    *,
+    alternates_map: dict[str, list[dict]] | None = None,
+    show_alternates: bool = False,
+) -> None:
     pad = "  " * indent
     if node.get("leaf"):
         reason = node.get("stop_reason", "")
-        print(f"{pad}{node['id']}  {_fmt_num(node['amount'])}  [{reason}]")
+        print(f"{pad}{node['id']} ({node['name']})  {_fmt_num(node['amount'])}  [{reason}]")
         return
     r = node["recipe"]
-    print(f"{pad}{node['id']}  {_fmt_num(node['amount'])}  <- {r['id']} x{_fmt_num(r['batches'])}")
+    print(
+        f"{pad}{node['id']} ({node['name']})  {_fmt_num(node['amount'])}"
+        f"  <- {r['id']} ({r['name']}) x{_fmt_num(r['batches'])}"
+    )
+    if show_alternates and alternates_map is not None:
+        # Every OTHER candidate recipe that could have produced this node,
+        # per the same alternates_map `_expand_node` already builds and every
+        # other caller discards — tagged with the engine's own tag/tag_reason
+        # rather than re-deriving tech status, since that's already computed
+        # for this exact call's tech-scoping.
+        for alt in alternates_map.get(node["id"], []):
+            if alt.get("selected"):
+                continue
+            reason = f": {alt['tag_reason']}" if alt.get("tag_reason") else ""
+            print(f"{pad}    alt: {alt['id']} ({alt['name']})  [{alt.get('tag', '')}{reason}]")
     for child in node.get("ingredients", []):
-        _print_tree(child, indent + 1)
+        _print_tree(
+            child, indent + 1, alternates_map=alternates_map, show_alternates=show_alternates
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +485,8 @@ async def cmd_status(args: argparse.Namespace) -> int:
             "\nbelt/pipe throughput constants are base/Space Age placeholders — see planner/throughput.py"
         )
     print(
-        "\nnext: `plan <product> --rate <n>` to design a line; `have <item>` to check current production."
+        "\nnext: `recommend <product>` for the single best way to make something right now; "
+        "`plan <product> --rate <n>` to design a line; `have <item>` to check current production."
     )
     return 0
 
@@ -327,7 +597,7 @@ def _print_plan_verbose(
         r_per_sec = r["amount_per_min"] / 60.0
         belts = throughput.belts_needed(r_per_sec)
         line = (
-            f"  {r['id']:<28} {_fmt_num(r['amount_per_min']):>10}/min"
+            f"  {r['id']:<28} ({r['name']})  {_fmt_num(r['amount_per_min']):>10}/min"
             f"  ({_fmt_num(belts['belts'])} {belts['tier']} belts)"
         )
         have_net = net.get(r["id"])
@@ -402,8 +672,9 @@ def _print_plan_verbose(
         )
 
     print(
-        f"\nnext: `expand {result['product']} --rate {args.rate} --unit {args.unit}` "
-        f"for the full BOM tree; `have <item>` to check current production of a specific input."
+        f"\nnext: `expand {result['product']} --rate {_fmt_num(result['rate_per_min'] / 60.0)} "
+        f"--unit per-sec` for the full BOM tree; `have <item>` to check current production "
+        "of a specific input."
     )
 
 
@@ -433,7 +704,7 @@ def _print_plan_compact(
 
     def _raw_str(r: dict) -> str:
         tag = " [tech-locked]" if _is_tech_locked(r["id"], tech_locked_notes) else ""
-        return f"{r['id']} {_fmt_num(r['amount_per_min'])}/min{tag}"
+        return f"{r['id']} ({r['name']}) {_fmt_num(r['amount_per_min'])}/min{tag}"
 
     raw = ", ".join(_raw_str(r) for r in raw_inputs) or "(none)"
     print(f"raw inputs: {raw}")
@@ -474,11 +745,13 @@ async def cmd_plan(args: argparse.Namespace) -> int:
     engine = _make_engine()
     if engine is None:
         return 1
+    row, candidates = await _resolve_item(engine, args.product)
+    if row is None:
+        return _print_ambiguous(args.product, candidates)
+
     gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
     db_tech_ids = await _db_tech_ids(engine)
     align = live_state.modpack_alignment(gs, db_tech_ids, force=args.force)
-
-    rate_per_min = args.rate * 60.0 if args.unit == "per-sec" else args.rate
 
     scoping: dict = {}
     if align["aligned"]:
@@ -493,14 +766,35 @@ async def cmd_plan(args: argparse.Namespace) -> int:
     if recipe_overrides:
         scoping["recipe_overrides"] = recipe_overrides
 
-    result = await engine.plan_product(
-        args.product, rate_per_min=rate_per_min, max_depth=args.max_depth, **scoping
-    )
+    if args.rate is None:
+        extra_unlocked = await engine.unlocked_recipes_for_techs(scoping.get("assume_researched"))
+        enforce_tech = scoping.get("only_enabled", False) or bool(extra_unlocked)
+        sizing = await _one_machine_rate_per_min(
+            engine,
+            row["name"],
+            extra_unlocked=extra_unlocked,
+            enforce_tech=enforce_tech,
+            overrides=recipe_overrides,
+        )
+        if sizing is None:
+            return _fail(
+                f"no available recipe/machine found to size a single-machine plan for "
+                f"'{row['name']}' — pass --rate explicitly"
+            )
+        rate_per_min, sizing_info = sizing
+        print(
+            f"(no --rate given — sizing for 1x {sizing_info['machine_name']} running "
+            f"'{sizing_info['recipe']}' -> {_fmt_num(rate_per_min)}/min)\n"
+        )
+    else:
+        try:
+            rate_per_min = _parse_rate_per_min(args.rate, args.unit)
+        except ValueError as e:
+            return _fail(str(e))
 
-    if "error" in result:
-        return _fail(result["error"])
-    if result.get("ambiguous"):
-        return _print_ambiguous(args.product, result["candidates"])
+    result = await engine.plan_product(
+        row["name"], rate_per_min=rate_per_min, max_depth=args.max_depth, **scoping
+    )
 
     net = live_state.net_production(gs, force=args.force) if align["aligned"] else {}
     stock = live_state.buffered_stock(gs, force=args.force) if align["aligned"] else {}
@@ -551,13 +845,39 @@ async def cmd_expand(args: argparse.Namespace) -> int:
             "  (live tech-scoping skipped — recipes.db and live save are different modpacks; see `status`)"
         )
 
-    amount = args.rate * 60.0 if args.unit == "per-sec" else args.rate
+    recipe_overrides = _parse_recipe_overrides(args.recipe)
+    if args.rate is None:
+        sizing = await _one_machine_rate_per_min(
+            engine,
+            row["name"],
+            extra_unlocked=extra_unlocked,
+            enforce_tech=bool(extra_unlocked),
+            overrides=recipe_overrides,
+        )
+        if sizing is None:
+            return _fail(
+                f"no available recipe/machine found to size a single-machine expand for "
+                f"'{row['name']}' — pass --rate explicitly"
+            )
+        amount, sizing_info = sizing
+        print(
+            f"(no --rate given — sizing for 1x {sizing_info['machine_name']} running "
+            f"'{sizing_info['recipe']}' -> {_fmt_num(amount)}/min)\n"
+        )
+    else:
+        try:
+            amount = _parse_rate_per_min(args.rate, args.unit)
+        except ValueError as e:
+            return _fail(str(e))
     stop_items = frozenset(s.strip() for s in (args.stop_items or "").split(",") if s.strip())
     if args.auto_stop_raw:
         stop_items = stop_items | await engine._auto_raw_items()
     totals_items: dict[str, float] = {}
     totals_fluids: dict[str, float] = {}
     selection_notes: list[str] = []
+    # Kept (not thrown away like every other caller) so --alternates can
+    # render it — see _print_tree.
+    alternates_map: dict[str, list[dict]] = {}
     tree = await engine._expand_node(
         row["name"],
         row["kind"],
@@ -568,29 +888,39 @@ async def cmd_expand(args: argparse.Namespace) -> int:
         stop_cats=frozenset(),
         stop_items=stop_items,
         prefer_enabled=True,
-        overrides=_parse_recipe_overrides(args.recipe),
+        overrides=recipe_overrides,
         ancestors=frozenset(),
         totals_items=totals_items,
         totals_fluids=totals_fluids,
         unresolved=[],
-        alternates_map={},
+        alternates_map=alternates_map,
         selection_notes=selection_notes,
         extra_unlocked=extra_unlocked,
         enforce_tech=bool(extra_unlocked),
     )
 
     print(
-        f"expand: {row['name']}  amount={_fmt_num(amount)}/min-equivalent (max_depth={args.max_depth})"
+        f"expand: {row['name']} ({row['translated_name']})  "
+        f"amount={_fmt_num(amount)}/min-equivalent (max_depth={args.max_depth})"
     )
     print()
-    _print_tree(tree)
+    _print_tree(tree, alternates_map=alternates_map, show_alternates=args.alternates)
+
+    raw_ids = list(totals_items) + list(totals_fluids)
+    raw_names: dict[str, str] = {}
+    if raw_ids:
+        name_rows = await engine.db.fetch_all(
+            f"SELECT name, translated_name FROM names WHERE name IN ({','.join('?' * len(raw_ids))})",
+            tuple(raw_ids),
+        )
+        raw_names = {r["name"]: r["translated_name"] for r in name_rows}
 
     print(f"\nraw totals ({len(totals_items) + len(totals_fluids)}):")
     combined = sorted(totals_items.items(), key=lambda kv: -kv[1]) + sorted(
         totals_fluids.items(), key=lambda kv: -kv[1]
     )
     for k, v in combined[: args.top]:
-        print(f"  {k}: {_fmt_num(v)}")
+        print(f"  {k} ({raw_names.get(k, k)}): {_fmt_num(v)}")
 
     tech_locked_notes = [n for n in selection_notes if "tech-locked" in n]
     if tech_locked_notes:
@@ -604,11 +934,722 @@ async def cmd_expand(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# options — decision-oriented menu: distinct viable ways to make a product
+# ---------------------------------------------------------------------------
+
+
+_OPTION_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _print_options_entry(
+    label: str,
+    item_id: str,
+    r: dict,
+    cls: dict,
+    tag: str,
+    tree: dict,
+    totals_items: dict[str, float],
+    totals_fluids: dict[str, float],
+    alternates_map: dict[str, list[dict]],
+    top: int,
+) -> None:
+    """Print one menu entry — a single viable top-level recipe for `item_id`,
+    already expanded (forcing that recipe) into `tree`/`alternates_map`."""
+    stages = tree_stages(tree)
+    categories: set[str] = set()
+    tree_categories(tree, categories)
+
+    flags = []
+    if cls["byproduct"]:
+        flags.append("byproduct")
+    if cls["absurd"]:
+        flags.append(f"~{cls['machines_per_yardstick']} machines/yardstick")
+    flag_str = f"  [{', '.join(flags)}]" if flags else ""
+
+    stage_word = "stage" if stages == 1 else "stages"
+    print(
+        f"[{label}] {item_id} <- {r['name']} ({r['translated_name']})  "
+        f"{stages} {stage_word}{tag}{flag_str}"
+    )
+
+    combined = sorted(totals_items.items(), key=lambda kv: -kv[1]) + sorted(
+        totals_fluids.items(), key=lambda kv: -kv[1]
+    )
+    raw_str = ", ".join(f"{k} {_fmt_num(v)}/min" for k, v in combined[:top]) or "(none)"
+    print(f"    raw: {raw_str}")
+    print(f"    machines: {', '.join(sorted(categories)) or '(none)'}")
+
+    for did, n in deeper_choices(alternates_map, item_id):
+        print(f"    deeper choice: {did} ({n} viable recipes) — run `options {did}`")
+    print()
+
+
+async def _classify_and_expand_candidates(
+    engine: ModuleType,
+    item_id: str,
+    item_kind: str,
+    rows: list[dict],
+    status: dict[str, str],
+    rate_per_min: float,
+    recipe_overrides: dict[str, str],
+    stop_items: frozenset[str],
+    extra_unlocked: frozenset[str],
+    enforce_tech: bool,
+    max_depth: int,
+    include_byproducts: bool,
+) -> tuple[list[dict], int]:
+    """Classify every producer row for `item_id` (hiding byproduct/impractical
+    ones unless `include_byproducts`), then force-expand each shown
+    candidate's own recipe via `engine._expand_node` to get its full
+    tree/raw-totals/alternates — the shared core of `cmd_options` and
+    `cmd_recommend`, extracted so `recommend` doesn't re-derive this. Returns
+    (shown, hidden_count) where each shown entry is {"row", "cls", "tag",
+    "tree", "totals_items", "totals_fluids", "alt_map"}."""
+    machine_speed_cache: dict[str, float] = {}
+    shown: list[dict] = []
+    hidden_count = 0
+    for r in rows:
+        category = r["category"]
+        if category not in machine_speed_cache:
+            machine = await _fastest_eligible_machine(
+                engine, category, extra_unlocked=extra_unlocked, enforce_tech=enforce_tech
+            )
+            machine_speed_cache[category] = float(machine["crafting_speed"]) if machine else 0.0
+        eff_out = engine._effective_out(
+            {
+                "out_amount": r["amount"],
+                "amount_min": r["amount_min"],
+                "amount_max": r["amount_max"],
+                "probability": r["probability"],
+            }
+        )
+        cls = classify_producer(
+            recipe_id=r["name"],
+            is_main_product=(r["main_product"] == item_id),
+            probability=float(r["probability"] if r["probability"] is not None else 1.0),
+            eff_out=eff_out,
+            energy=float(r["energy"] or 0.0),
+            fastest_speed=machine_speed_cache[category],
+            yardstick_per_min=rate_per_min,
+        )
+        if cls["hidden"] and not include_byproducts:
+            hidden_count += 1
+            continue
+
+        override = {**recipe_overrides, item_id: r["name"]}
+        totals_items: dict[str, float] = {}
+        totals_fluids: dict[str, float] = {}
+        alt_map: dict[str, list[dict]] = {}
+        tree = await engine._expand_node(
+            item_id,
+            item_kind,
+            rate_per_min,
+            depth=0,
+            max_depth=max_depth,
+            exclude_cats=engine._DEFAULT_EXCLUDE,
+            stop_cats=frozenset(),
+            stop_items=stop_items,
+            prefer_enabled=True,
+            overrides=override,
+            ancestors=frozenset(),
+            totals_items=totals_items,
+            totals_fluids=totals_fluids,
+            unresolved=[],
+            alternates_map=alt_map,
+            selection_notes=[],
+            extra_unlocked=extra_unlocked,
+            enforce_tech=enforce_tech,
+        )
+        shown.append(
+            {
+                "row": r,
+                "cls": cls,
+                "tag": status.get(r["name"], ""),
+                "tree": tree,
+                "totals_items": totals_items,
+                "totals_fluids": totals_fluids,
+                "alt_map": alt_map,
+            }
+        )
+    return shown, hidden_count
+
+
+async def cmd_options(args: argparse.Namespace) -> int:
+    engine = _make_engine()
+    if engine is None:
+        return 1
+    row, candidates = await _resolve_item(engine, args.product)
+    if row is None:
+        return _print_ambiguous(args.product, candidates)
+    item_id, item_kind = row["name"], row["kind"]
+
+    aligned, extra_unlocked = await _live_extra_unlocked(engine, args)
+    enforce_tech = bool(extra_unlocked)
+    if not aligned:
+        print(
+            "  (live tech-scoping skipped — recipes.db and live save are different modpacks; see `status`)"
+        )
+
+    recipe_overrides = _parse_recipe_overrides(args.recipe)
+    stop_items = frozenset(s.strip() for s in (args.stop_items or "").split(",") if s.strip())
+    if args.auto_stop_raw:
+        stop_items = stop_items | await engine._auto_raw_items()
+
+    # Unlike `plan`/`expand`'s "size for 1 machine of the auto-picked recipe"
+    # default, `options` needs ONE consistent yardstick across every
+    # candidate so their machine counts/raw inputs are actually comparable
+    # side by side — defaulting per-candidate would make a slow recipe look
+    # falsely cheap just because "1 machine of it" is a tiny rate.
+    try:
+        rate_per_min = _rate_per_min_or_default(args.rate, args.unit)
+    except ValueError as e:
+        return _fail(str(e))
+
+    # Same columns cmd_producers already selects, so classify_producer has
+    # everything it needs without a second query.
+    rows = await engine.db.fetch_all(
+        """SELECT r.name, r.translated_name, r.category, r.enabled, r.main_product, r.energy,
+                  p.amount, p.amount_min, p.amount_max, p.probability
+           FROM recipe_products p JOIN recipes r ON r.name = p.recipe_name
+           WHERE p.item_name = ? ORDER BY r.enabled DESC, r.translated_name COLLATE NOCASE""",
+        (item_id,),
+    )
+    # Void/incineration-style categories are excluded everywhere else in this
+    # tool by default (engine._DEFAULT_EXCLUDE) — not real production choices.
+    rows = [r for r in rows if r["category"] not in engine._DEFAULT_EXCLUDE]
+    if not rows:
+        print(f"nothing produces '{item_id}' (excluding void/incineration-style categories).")
+        return 1
+
+    status = await _tech_status_labels(engine, rows, extra_unlocked, aligned)
+
+    shown, hidden_count = await _classify_and_expand_candidates(
+        engine,
+        item_id,
+        item_kind,
+        rows,
+        status,
+        rate_per_min,
+        recipe_overrides,
+        stop_items,
+        extra_unlocked,
+        enforce_tech,
+        args.max_depth,
+        args.include_byproducts,
+    )
+
+    if not shown:
+        print(
+            f"{item_id}: no viable (non-byproduct/practical) producer found — "
+            "pass --include-byproducts to see hidden options."
+        )
+        return 1
+
+    per_sec = rate_per_min / 60.0
+    print(
+        f"{item_id} ({row.get('translated_name', item_id)})  "
+        f"— {len(shown)} viable way(s) at {_fmt_num(rate_per_min)}/min ({_fmt_num(per_sec)}/s):\n"
+    )
+
+    for i, entry in enumerate(shown):
+        label = _OPTION_LABELS[i] if i < len(_OPTION_LABELS) else str(i)
+        _print_options_entry(
+            label,
+            item_id,
+            entry["row"],
+            entry["cls"],
+            entry["tag"],
+            entry["tree"],
+            entry["totals_items"],
+            entry["totals_fluids"],
+            entry["alt_map"],
+            args.top,
+        )
+
+    if hidden_count:
+        print(
+            f"hidden: {hidden_count} byproduct/impractical recipe(s) (--include-byproducts to show)"
+        )
+    print(
+        f"\nnext: `plan {item_id} --recipe {item_id}=<recipe_id> --rate <n>` to build the chosen way."
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# tech — what a technology unlocks, and whether the unlocked recipes form a
+# co-product recycling bundle (see planner/techbundle.py's module docstring
+# for why this is scoped to one tech's unlock set rather than the whole
+# recipe graph)
+# ---------------------------------------------------------------------------
+
+
+async def _tech_status(engine: ModuleType, tech_id: str, researched_techs: set[str]) -> str:
+    """`[researched]` / `[needs: X, Y]` / `[not yet researched]` tag for a
+    technology itself — mirrors `_tech_status_labels`'s tagging style for
+    recipes, applied one level up to the tech."""
+    if tech_id in researched_techs:
+        return "  [researched]"
+    prereqs = await engine.db.fetch_all(
+        "SELECT prereq_name FROM technology_prerequisites WHERE tech_name = ?", (tech_id,)
+    )
+    missing_ids = [p["prereq_name"] for p in prereqs if p["prereq_name"] not in researched_techs]
+    if not missing_ids:
+        return "  [not yet researched]"
+    name_rows = await engine.db.fetch_all(
+        f"SELECT name, translated_name FROM technologies WHERE name IN ({','.join('?' * len(missing_ids))})",
+        tuple(missing_ids),
+    )
+    names = {r["name"]: r["translated_name"] for r in name_rows}
+    missing = [names.get(mid, mid) for mid in missing_ids]
+    return f"  [needs: {', '.join(missing)}]"
+
+
+async def _fetch_recipe_ios(engine: ModuleType, recipe_names: list[str]) -> dict[str, dict]:
+    """Full ingredient/product lists for `recipe_names`, collapsed into
+    `techbundle.RecipeIO` shape — products collapse probability into
+    expected amount exactly as `engine._effective_out` does, but WITHOUT
+    that function's epsilon floor (a matrix coefficient needs an exact
+    structural zero for "doesn't touch this item", not a tiny nonzero;
+    see techbundle.py's module docstring)."""
+    placeholders = ",".join("?" * len(recipe_names))
+    ing_rows = await engine.db.fetch_all(
+        f"SELECT recipe_name, item_name, amount FROM recipe_ingredients WHERE recipe_name IN ({placeholders})",
+        tuple(recipe_names),
+    )
+    prod_rows = await engine.db.fetch_all(
+        f"""SELECT recipe_name, item_name, amount, amount_min, amount_max, probability
+            FROM recipe_products WHERE recipe_name IN ({placeholders})""",
+        tuple(recipe_names),
+    )
+    recipe_ios: dict[str, dict] = {
+        name: {"ingredients": [], "products": []} for name in recipe_names
+    }
+    for r in ing_rows:
+        recipe_ios[r["recipe_name"]]["ingredients"].append((r["item_name"], float(r["amount"])))
+    for r in prod_rows:
+        amount = r["amount"]
+        if amount is None:
+            amount = ((r["amount_min"] or 0.0) + (r["amount_max"] or 0.0)) / 2.0
+        probability = r["probability"] if r["probability"] is not None else 1.0
+        expected = float(amount) * float(probability)
+        recipe_ios[r["recipe_name"]]["products"].append((r["item_name"], expected))
+    return recipe_ios
+
+
+async def cmd_tech(args: argparse.Namespace) -> int:
+    engine = _make_engine()
+    if engine is None:
+        return 1
+    row, candidates = await _resolve_tech(engine, args.name)
+    if row is None:
+        return _print_ambiguous_tech(args.name, candidates)
+    tech_id, tech_name = row["name"], row["translated_name"]
+
+    gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
+    db_tech_ids = await _db_tech_ids(engine)
+    align = live_state.modpack_alignment(gs, db_tech_ids, force=args.force)
+    researched_techs: set[str] = set()
+    extra_unlocked: frozenset[str] = frozenset()
+    if align["aligned"]:
+        researched_list = live_state.researched_technologies(gs, force=args.force)
+        researched_techs = set(researched_list)
+        extra_unlocked = await engine.unlocked_recipes_for_techs(researched_list)
+        status = await _tech_status(engine, tech_id, researched_techs)
+    else:
+        status = ""
+        print(
+            "  (live tech-scoping skipped — recipes.db and live save are different modpacks; see `status`)"
+        )
+    print(f"{tech_id} ({tech_name}){status}")
+
+    unlock_rows = await engine.db.fetch_all(
+        """SELECT r.name, r.translated_name, r.category, r.energy
+           FROM technology_recipe_unlocks tru JOIN recipes r ON r.name = tru.recipe_name
+           WHERE tru.tech_name = ? ORDER BY r.translated_name COLLATE NOCASE""",
+        (tech_id,),
+    )
+    if not unlock_rows:
+        print("\nunlocks: (no recipes)")
+        return 0
+
+    print(f"\nunlocks ({len(unlock_rows)} recipe(s)):")
+    if len(unlock_rows) > techbundle.SIZE_CAP:
+        print(f"  too many to analyze as one bundle (cap: {techbundle.SIZE_CAP}) — listing only:")
+        for r in unlock_rows:
+            print(f"  {r['name']:<32} ({r['translated_name']})  [{r['category']}]")
+        return 0
+
+    recipe_names = [r["name"] for r in unlock_rows]
+    recipe_display = {r["name"]: r for r in unlock_rows}
+    recipe_ios = await _fetch_recipe_ios(engine, recipe_names)
+
+    components = techbundle.find_components(recipe_ios)
+    singletons = sorted((c for c in components if len(c) == 1), key=lambda c: next(iter(c)))
+    bundles = [c for c in components if len(c) > 1]
+
+    for c in singletons:
+        rid = next(iter(c))
+        r = recipe_display[rid]
+        print(f"  also unlocks: {rid} ({r['translated_name']})  [{r['category']}]")
+
+    try:
+        rate_per_min = _rate_per_min_or_default(args.rate, args.unit)
+    except ValueError as e:
+        return _fail(str(e))
+    enforce_tech = bool(extra_unlocked)
+
+    consume_item: str | None = None
+    consume_rate_per_min = 0.0
+    if args.consume:
+        if "=" not in args.consume:
+            return _fail(f"--consume must be ITEM=RATE, got {args.consume!r}")
+        consume_item, consume_rate_str = args.consume.split("=", 1)
+        consume_item = consume_item.strip()
+        try:
+            consume_rate_per_min = _parse_rate_per_min(consume_rate_str, args.unit)
+        except ValueError as e:
+            return _fail(f"--consume {e}")
+    consume_matched = False
+
+    all_item_ids: set[str] = set()
+    for component in bundles:
+        boundary = techbundle.classify_boundary(component, recipe_ios)
+        all_item_ids |= boundary["external_outputs"] | boundary["external_inputs"]
+    item_names = await _item_translated_names(engine, sorted(all_item_ids))
+
+    def _iid(item_id: str) -> str:
+        name = item_names.get(item_id)
+        return f"{item_id} ({name})" if name else item_id
+
+    def _rid(rid: str) -> str:
+        name = recipe_display[rid]["translated_name"]
+        return f"{rid} ({name})" if name else rid
+
+    for component in bundles:
+        boundary = techbundle.classify_boundary(component, recipe_ios)
+        print(f"\ndetected bundle: {', '.join(_rid(rid) for rid in sorted(component))}")
+
+        consuming = consume_item is not None and consume_item in boundary["external_inputs"]
+        if consuming:
+            consume_matched = True
+            anchor = consume_item
+            target_rate = -consume_rate_per_min
+        else:
+            anchor = args.anchor or techbundle.default_anchor(
+                component, recipe_ios, boundary["external_outputs"]
+            )
+            if anchor is None:
+                print("  (closed loop — no external output to size a plan against)")
+                continue
+            target_rate = rate_per_min
+
+        result = techbundle.solve_component(component, recipe_ios, anchor, target_rate)
+        if result["status"] != "solved":
+            print(f"  could not combine into one blend ({result['status']}): {result['reason']}")
+            print("  see these recipes individually via `options <item>` instead.")
+            continue
+
+        if consuming:
+            print(
+                f"  sizing to fully consume: {_iid(anchor)} @ {_fmt_num(consume_rate_per_min)}/min"
+            )
+        else:
+            others = boundary["external_outputs"] - {anchor}
+            other_note = (
+                f"  (also produces: {', '.join(_iid(o) for o in sorted(others))})" if others else ""
+            )
+            print(f"  anchor: {_iid(anchor)} @ {_fmt_num(rate_per_min)}/min{other_note}")
+
+        for rid in sorted(component):
+            rate = result["batch_rates"][rid]
+            r = recipe_display[rid]
+            machine = await _fastest_eligible_machine(
+                engine, r["category"], extra_unlocked=extra_unlocked, enforce_tech=enforce_tech
+            )
+            machine_note = ""
+            energy = float(r["energy"] or 0.0)
+            if machine and energy > 0:
+                speed = float(machine["crafting_speed"] or 1.0)
+                count = math.ceil(rate * energy / (60.0 * speed))
+                machine_note = f"  ~{count}x {machine['translated_name']}"
+            print(f"    {_rid(rid):<40} {_fmt_num(rate)}/min{machine_note}")
+
+        print(
+            "  (for a different target rate, re-run with --rate <n> --unit per-min/per-sec "
+            "directly — do NOT multiply these counts by hand: each is already rounded up "
+            "individually, so scaling the rounded counts overcounts. Scale the RATE, not the "
+            "machine counts.)"
+        )
+
+        if consuming:
+            print("  external outputs:")
+            for item_id in sorted(boundary["external_outputs"]):
+                total = sum(
+                    amount * result["batch_rates"][rid]
+                    for rid in component
+                    for iid, amount in recipe_ios[rid]["products"]
+                    if iid == item_id
+                )
+                print(f"    {_iid(item_id):<40} {_fmt_num(total)}/min")
+
+        if boundary["external_inputs"]:
+            print("  external inputs:")
+            for item_id in sorted(boundary["external_inputs"]):
+                total = sum(
+                    amount * result["batch_rates"][rid]
+                    for rid in component
+                    for iid, amount in recipe_ios[rid]["ingredients"]
+                    if iid == item_id
+                )
+                print(f"    {_iid(item_id):<40} {_fmt_num(total)}/min")
+
+    if args.consume and not consume_matched:
+        print(
+            f"\n(--consume {consume_item}={_fmt_num(consume_rate_per_min)}/min didn't match any "
+            "bundle's external inputs above — check the item id against the 'external inputs' "
+            "lists printed above; fell back to --rate/--anchor sizing instead)"
+        )
+
+    return 0
+
+
+async def _tech_bundle_for_candidate(
+    engine: ModuleType, recipe_id: str, anchor_item: str, rate_per_min: float
+) -> dict | None:
+    """If `recipe_id` is unlocked by a technology whose OTHER unlocked
+    recipes combine with it into a co-product recycling bundle that
+    produces `anchor_item` as an external output, solve that bundle at
+    `rate_per_min` and return {"tech_id", "tech_name", "component",
+    "result", "raw_totals"}. Returns None if `recipe_id` has no unlocking
+    tech, isn't part of a size>=2 component, that component doesn't produce
+    `anchor_item`, or the bundle doesn't solve cleanly (underdetermined/
+    infeasible) — in any of those cases the caller should fall back to
+    `recipe_id`'s own single-recipe cost.
+
+    A recipe can rarely (14 of ~6150 unlockable recipes, per a live count)
+    have more than one unlocking tech — try each in turn, use the first
+    that yields a solvable bundle."""
+    tech_rows = await engine.db.fetch_all(
+        "SELECT tech_name FROM technology_recipe_unlocks WHERE recipe_name = ?", (recipe_id,)
+    )
+    for t in tech_rows:
+        tech_id = t["tech_name"]
+        unlock_rows = await engine.db.fetch_all(
+            """SELECT r.name FROM technology_recipe_unlocks tru JOIN recipes r ON r.name = tru.recipe_name
+               WHERE tru.tech_name = ?""",
+            (tech_id,),
+        )
+        recipe_names = [r["name"] for r in unlock_rows]
+        if recipe_id not in recipe_names or len(recipe_names) > techbundle.SIZE_CAP:
+            continue
+        recipe_ios = await _fetch_recipe_ios(engine, recipe_names)
+        component = next(
+            (c for c in techbundle.find_components(recipe_ios) if recipe_id in c and len(c) > 1),
+            None,
+        )
+        if component is None:
+            continue
+        boundary = techbundle.classify_boundary(component, recipe_ios)
+        if anchor_item not in boundary["external_outputs"]:
+            continue
+        result = techbundle.solve_component(component, recipe_ios, anchor_item, rate_per_min)
+        if result["status"] != "solved":
+            continue
+        raw_totals: dict[str, float] = {}
+        for item_id in boundary["external_inputs"]:
+            total = sum(
+                amount * result["batch_rates"][rid]
+                for rid in component
+                for iid, amount in recipe_ios[rid]["ingredients"]
+                if iid == item_id
+            )
+            raw_totals[item_id] = total
+        tech_name_row = await engine.db.fetch_one(
+            "SELECT translated_name FROM technologies WHERE name = ?", (tech_id,)
+        )
+        return {
+            "tech_id": tech_id,
+            "tech_name": tech_name_row["translated_name"] if tech_name_row else tech_id,
+            "component": component,
+            "result": result,
+            "raw_totals": raw_totals,
+        }
+    return None
+
+
+async def cmd_recommend(args: argparse.Namespace) -> int:
+    engine = _make_engine()
+    if engine is None:
+        return 1
+    row, candidates = await _resolve_item(engine, args.product)
+    if row is None:
+        return _print_ambiguous(args.product, candidates)
+    item_id, item_kind = row["name"], row["kind"]
+
+    aligned, extra_unlocked = await _live_extra_unlocked(engine, args)
+    enforce_tech = bool(extra_unlocked)
+    if not aligned:
+        print(
+            "  (live tech-scoping skipped — recipes.db and live save are different modpacks; see `status`)"
+        )
+
+    recipe_overrides = _parse_recipe_overrides(args.recipe)
+    stop_items = frozenset(s.strip() for s in (args.stop_items or "").split(",") if s.strip())
+    if args.auto_stop_raw:
+        stop_items = stop_items | await engine._auto_raw_items()
+
+    try:
+        rate_per_min = _rate_per_min_or_default(args.rate, args.unit)
+    except ValueError as e:
+        return _fail(str(e))
+
+    rows = await engine.db.fetch_all(
+        """SELECT r.name, r.translated_name, r.category, r.enabled, r.main_product, r.energy,
+                  p.amount, p.amount_min, p.amount_max, p.probability
+           FROM recipe_products p JOIN recipes r ON r.name = p.recipe_name
+           WHERE p.item_name = ? ORDER BY r.enabled DESC, r.translated_name COLLATE NOCASE""",
+        (item_id,),
+    )
+    rows = [r for r in rows if r["category"] not in engine._DEFAULT_EXCLUDE]
+    if not rows:
+        print(f"nothing produces '{item_id}' (excluding void/incineration-style categories).")
+        return 1
+
+    status = await _tech_status_labels(engine, rows, extra_unlocked, aligned)
+
+    # Never recommend a byproduct/impractical recipe -- include_byproducts is
+    # always False here, unlike `options` which lets the caller opt in.
+    shown, _hidden_count = await _classify_and_expand_candidates(
+        engine,
+        item_id,
+        item_kind,
+        rows,
+        status,
+        rate_per_min,
+        recipe_overrides,
+        stop_items,
+        extra_unlocked,
+        enforce_tech,
+        args.max_depth,
+        include_byproducts=False,
+    )
+    if not shown:
+        print(f"{item_id}: no viable (non-byproduct/practical) producer found.")
+        return 1
+
+    summaries: list[dict] = []
+    combo_by_recipe: dict[str, dict] = {}
+    for entry in shown:
+        r = entry["row"]
+        recipe_id = r["name"]
+        tag = entry["tag"]
+        researched = tag in ("", "  [researched]")
+        raw_totals = {**entry["totals_items"], **entry["totals_fluids"]}
+
+        if researched:
+            combo = await _tech_bundle_for_candidate(engine, recipe_id, item_id, rate_per_min)
+            if combo is not None:
+                raw_totals = combo["raw_totals"]
+                combo_by_recipe[recipe_id] = combo
+
+        summaries.append(
+            {
+                "recipe_id": recipe_id,
+                "researched": researched,
+                "raw_totals": raw_totals,
+                "stages": tree_stages(entry["tree"]),
+                "tag": tag,
+            }
+        )
+
+    usable = [s for s in summaries if s["researched"]]
+    locked_count = len(summaries) - len(usable)
+    if not usable:
+        print(
+            f"{item_id}: nothing currently researched can produce it — "
+            f"see `options {item_id}` for what research would unlock."
+        )
+        return 1
+
+    ranked = rank_candidates(usable)
+    winner = ranked[0]
+    combo = combo_by_recipe.get(winner["recipe_id"])
+
+    all_recipe_ids = {s["recipe_id"] for s in summaries}
+    if combo is not None:
+        all_recipe_ids |= set(combo["component"])
+    recipe_names = await _recipe_translated_names(engine, sorted(all_recipe_ids))
+
+    def _rid(rid: str) -> str:
+        name = recipe_names.get(rid)
+        return f"{rid} ({name})" if name else rid
+
+    def _raw_str(totals: dict[str, float]) -> str:
+        return (
+            ", ".join(
+                f"{k} {_fmt_num(v)}/min" for k, v in sorted(totals.items(), key=lambda kv: -kv[1])
+            )
+            or "(none)"
+        )
+
+    per_sec = rate_per_min / 60.0
+    print(
+        f"{item_id} ({row.get('translated_name', item_id)}) — recommended at "
+        f"{_fmt_num(rate_per_min)}/min ({_fmt_num(per_sec)}/s):\n"
+    )
+
+    if combo is not None:
+        recipe_list = ", ".join(_rid(rid) for rid in sorted(combo["component"]))
+        print(f'recommended: {recipe_list}  (combo via "{combo["tech_name"]}")')
+        print(f"  {_raw_str(winner['raw_totals'])}")
+        for rid in sorted(combo["component"]):
+            print(f"    {_rid(rid):<40} {_fmt_num(combo['result']['batch_rates'][rid])}/min")
+        print(
+            "  (this IS the build — `plan`/`expand` can't represent a blended multi-recipe "
+            "combo yet)"
+        )
+        print(
+            f'\nnext: `tech "{combo["tech_name"]}" --rate {_fmt_num(rate_per_min)} --unit per-min` '
+            "for machine counts at this exact rate — do NOT multiply this command's counts by "
+            "hand for a different rate, re-run it with the new --rate instead (each count is "
+            "already rounded up individually, so scaling the rounded counts overcounts)."
+        )
+    else:
+        stage_word = "stage" if winner["stages"] == 1 else "stages"
+        print(
+            f"recommended: {_rid(winner['recipe_id'])}  "
+            f"({winner['stages']} {stage_word}){winner['tag']}"
+        )
+        print(f"  {_raw_str(winner['raw_totals'])}")
+        print(
+            f"\nnext: `plan {item_id} --recipe {item_id}={winner['recipe_id']} --rate <n>` "
+            "to build it."
+        )
+
+    ungated = [s for s in ranked if s["tag"] == ""]
+    if ungated and ungated[0]["recipe_id"] != winner["recipe_id"]:
+        runner = ungated[0]
+        print(f"\nrunner-up (no research needed): {_rid(runner['recipe_id'])}")
+        print(f"  {_raw_str(runner['raw_totals'])}")
+
+    if locked_count:
+        print(
+            f"\n{locked_count} further option(s) need research not yet done — "
+            f"see `options {item_id}` for all of them."
+        )
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # recipe / producers / consumers — thin recipe lookups
 # ---------------------------------------------------------------------------
 
 
-async def _print_one_recipe(engine: ModuleType, name: str) -> bool:
+async def _print_one_recipe(
+    engine: ModuleType, name: str, extra_unlocked: frozenset[str], aligned: bool
+) -> bool:
     """Print full detail for one recipe. Returns False (having already
     printed the reason) if `name` didn't resolve to exactly one recipe."""
     db = engine.db
@@ -644,14 +1685,28 @@ async def _print_one_recipe(engine: ModuleType, name: str) -> bool:
         (row["name"],),
     )
 
-    print(f"{row['name']}  ({row['translated_name']})")
+    ing_prod_ids = [i["item_name"] for i in ingredients] + [p["item_name"] for p in products]
+    item_names: dict[str, str] = {}
+    if ing_prod_ids:
+        name_rows = await db.fetch_all(
+            f"SELECT name, translated_name FROM names WHERE name IN ({','.join('?' * len(ing_prod_ids))})",
+            tuple(ing_prod_ids),
+        )
+        item_names = {r["name"]: r["translated_name"] for r in name_rows}
+
+    status = (await _tech_status_labels(engine, [row], extra_unlocked, aligned)).get(
+        row["name"], ""
+    )
+
+    print(f"{row['name']}  ({row['translated_name']}){status}")
     print(
         f"  category: {row['category']}   craft time: {row['energy']}s   enabled: {bool(row['enabled'])}"
         f"   main product: {row['main_product'] or '(none)'}"
     )
     print("  ingredients:")
     for i in ingredients:
-        print(f"    {_fmt_num(i['amount'])}x {i['item_name']}")
+        item_id = i["item_name"]
+        print(f"    {_fmt_num(i['amount'])}x {item_id} ({item_names.get(item_id, item_id)})")
     print("  products:")
     craft_time = row["energy"]
     for p in products:
@@ -662,7 +1717,8 @@ async def _print_one_recipe(engine: ModuleType, name: str) -> bool:
         )
         prob = f" @ {p['probability'] * 100:.0f}%" if p["probability"] not in (None, 1.0) else ""
         rate = _rate_hint(p["amount"], p["probability"], craft_time)
-        print(f"    {amt}x {p['item_name']}{prob}{rate}")
+        item_id = p["item_name"]
+        print(f"    {amt}x {item_id} ({item_names.get(item_id, item_id)}){prob}{rate}")
     return True
 
 
@@ -670,12 +1726,67 @@ async def cmd_recipe(args: argparse.Namespace) -> int:
     engine = _make_engine()
     if engine is None:
         return 1
+    aligned, extra_unlocked = await _live_extra_unlocked(engine, args)
+    if not aligned:
+        print(
+            "  (live tech-scoping skipped — recipes.db and live save are different modpacks; see `status`)"
+        )
     ok = True
     for i, name in enumerate(args.name):
         if i > 0:
             print("---")
-        ok = await _print_one_recipe(engine, name) and ok
+        ok = await _print_one_recipe(engine, name, extra_unlocked, aligned) and ok
     return 0 if ok else 1
+
+
+async def _item_translated_name(engine: ModuleType, item_id: str) -> str:
+    row = await engine.db.fetch_one("SELECT translated_name FROM names WHERE name = ?", (item_id,))
+    return row["translated_name"] if row else item_id
+
+
+async def _item_translated_names(engine: ModuleType, item_ids: list[str]) -> dict[str, str]:
+    """Batch id -> translated_name lookup for items/fluids — same purpose
+    as `_recipe_translated_names`, for the item ids `tech`'s external
+    inputs/outputs rows print."""
+    if not item_ids:
+        return {}
+    rows = await engine.db.fetch_all(
+        f"SELECT name, translated_name FROM names WHERE name IN ({','.join('?' * len(item_ids))})",
+        tuple(item_ids),
+    )
+    return {r["name"]: r["translated_name"] for r in rows}
+
+
+async def _recipe_translated_names(engine: ModuleType, recipe_ids: list[str]) -> dict[str, str]:
+    """Batch id -> translated_name lookup for recipes, so combo/bundle
+    output can show `id (translated name)` the same way `producers`/
+    `consumers`/`recipe` already do — recipe ids are kept as the primary,
+    unambiguous identifier (two recipes can share one translated name, e.g.
+    Pyanodons' "grade-1-copper-crush"/"grade-2-copper" both translate to
+    "Copper (grade 2)"), the translated name is purely a UX add-on."""
+    if not recipe_ids:
+        return {}
+    rows = await engine.db.fetch_all(
+        f"SELECT name, translated_name FROM recipes WHERE name IN ({','.join('?' * len(recipe_ids))})",
+        tuple(recipe_ids),
+    )
+    return {r["name"]: r["translated_name"] for r in rows}
+
+
+async def _live_extra_unlocked(
+    engine: ModuleType, args: argparse.Namespace
+) -> tuple[bool, frozenset[str]]:
+    """(aligned, extra_unlocked) for the given --force — the same live
+    tech-scoping `plan`/`expand` already use, shared here so `producers`/
+    `consumers`/`recipe` can show real availability instead of the DB's
+    stale `enabled` snapshot."""
+    gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
+    db_tech_ids = await _db_tech_ids(engine)
+    align = live_state.modpack_alignment(gs, db_tech_ids, force=args.force)
+    if not align["aligned"]:
+        return False, frozenset()
+    researched = live_state.researched_technologies(gs, force=args.force)
+    return True, await engine.unlocked_recipes_for_techs(researched)
 
 
 async def cmd_producers(args: argparse.Namespace) -> int:
@@ -683,7 +1794,7 @@ async def cmd_producers(args: argparse.Namespace) -> int:
     if engine is None:
         return 1
     rows = await engine.db.fetch_all(
-        """SELECT r.name, r.category, r.enabled, r.main_product, r.energy,
+        """SELECT r.name, r.translated_name, r.category, r.enabled, r.main_product, r.energy,
                   p.amount, p.amount_min, p.amount_max, p.probability
            FROM recipe_products p JOIN recipes r ON r.name = p.recipe_name
            WHERE p.item_name = ? ORDER BY r.enabled DESC, r.translated_name COLLATE NOCASE""",
@@ -694,21 +1805,30 @@ async def cmd_producers(args: argparse.Namespace) -> int:
             f"nothing produces '{args.item}' (use the exact internal id — try `expand {args.item}` to check)."
         )
         return 1
-    print(f"producers of {args.item} ({len(rows)}):")
+    aligned, extra_unlocked = await _live_extra_unlocked(engine, args)
+    status = await _tech_status_labels(engine, rows, extra_unlocked, aligned)
+    if not aligned:
+        print(
+            "  (live tech-scoping skipped — recipes.db and live save are different modpacks; see `status`)"
+        )
+    item_name = await _item_translated_name(engine, args.item)
+    print(f"producers of {args.item} ({item_name}) ({len(rows)}):")
     for r in rows:
         amt = (
             _fmt_num(r["amount"])
             if r["amount"] is not None
             else f"{r['amount_min']}-{r['amount_max']}"
         )
-        flag = "" if r["enabled"] else "  [disabled]"
         # main_product == item_id means this is the recipe's actual purpose,
         # not a probabilistic/secondary byproduct of something else — the
         # auto-picker in `plan`/`expand` now prefers these (see engine.py's
         # _pick_producer Tier 1.5).
         main = "  [main product]" if r["main_product"] == args.item else ""
         rate = _rate_hint(r["amount"], r["probability"], r["energy"])
-        print(f"  {r['name']:<32} {amt}x  ({r['category']}){rate}{flag}{main}")
+        print(
+            f"  {r['name']:<32} ({r['translated_name']})  {amt}x  ({r['category']})"
+            f"{rate}{status.get(r['name'], '')}{main}"
+        )
     return 0
 
 
@@ -717,7 +1837,7 @@ async def cmd_consumers(args: argparse.Namespace) -> int:
     if engine is None:
         return 1
     rows = await engine.db.fetch_all(
-        """SELECT r.name, r.category, r.enabled, i.amount
+        """SELECT r.name, r.translated_name, r.category, r.enabled, i.amount
            FROM recipe_ingredients i JOIN recipes r ON r.name = i.recipe_name
            WHERE i.item_name = ? ORDER BY r.enabled DESC, r.translated_name COLLATE NOCASE""",
         (args.item,),
@@ -727,10 +1847,19 @@ async def cmd_consumers(args: argparse.Namespace) -> int:
             f"nothing consumes '{args.item}' (use the exact internal id — try `expand {args.item}` to check)."
         )
         return 1
-    print(f"consumers of {args.item} ({len(rows)}):")
+    aligned, extra_unlocked = await _live_extra_unlocked(engine, args)
+    status = await _tech_status_labels(engine, rows, extra_unlocked, aligned)
+    if not aligned:
+        print(
+            "  (live tech-scoping skipped — recipes.db and live save are different modpacks; see `status`)"
+        )
+    item_name = await _item_translated_name(engine, args.item)
+    print(f"consumers of {args.item} ({item_name}) ({len(rows)}):")
     for r in rows:
-        flag = "" if r["enabled"] else "  [disabled]"
-        print(f"  {r['name']:<32} {_fmt_num(r['amount'])}x  ({r['category']}){flag}")
+        print(
+            f"  {r['name']:<32} ({r['translated_name']})  {_fmt_num(r['amount'])}x  ({r['category']})"
+            f"{status.get(r['name'], '')}"
+        )
     return 0
 
 
@@ -743,17 +1872,74 @@ async def cmd_have(args: argparse.Namespace) -> int:
     gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
     net = live_state.net_production(gs, force=args.force)
     stock = live_state.buffered_stock(gs, force=args.force)
-    if args.item not in net and args.item not in stock:
+    ok = True
+    for item in args.item:
+        if item not in net and item not in stock:
+            print(
+                f"no live data for '{item}' on force '{args.force}' (not produced/consumed or buffered)."
+            )
+            print(
+                "next: check the exact item id, or `producers <item>`/`consumers <item>` to find it."
+            )
+            ok = False
+            continue
+        n = net.get(item, 0.0)
+        s = stock.get(item, 0)
+        verb = "producing" if n > 0 else "consuming" if n < 0 else "net-neutral on"
         print(
-            f"no live data for '{args.item}' on force '{args.force}' (not produced/consumed or buffered)."
+            f"{item}: {verb} {_fmt_num(abs(n))}/min, {s} buffered in logistics, force '{args.force}'"
         )
-        print("next: check the exact item id, or `producers <item>`/`consumers <item>` to find it.")
-        return 1
-    n = net.get(args.item, 0.0)
-    s = stock.get(args.item, 0)
-    verb = "producing" if n > 0 else "consuming" if n < 0 else "net-neutral on"
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
+# belts — reverse throughput sizing: N belts -> achievable rate
+# ---------------------------------------------------------------------------
+
+
+async def cmd_belts(args: argparse.Namespace) -> int:
+    """Pure throughput-constant math (works with no recipes.db/live data at
+    all), but when --tier is omitted it first tries live tech-scoping to
+    pick the fastest tier the current save can actually build, falling back
+    to the static base/starter tier (throughput.DEFAULT_BELT_TIER_ORDER[0])
+    whenever that data isn't available — so an unresearched game still gets
+    a correct default instead of the old silent fastest-tier assumption."""
+    tier = args.tier
+    tier_note: str | None = None
+    if tier is None and config.RECIPES_DB.exists():
+        engine = _make_engine()
+        if engine is not None:
+            aligned, extra_unlocked = await _live_extra_unlocked(engine, args)
+            if aligned:
+                tier = await _fastest_buildable_belt_tier(engine, extra_unlocked)
+                if tier is not None:
+                    tier_note = (
+                        f"(no --tier given — assumed {tier}, the fastest belt tier your "
+                        "current save can build. Pass --tier explicitly to override.)"
+                    )
+    try:
+        result = throughput.rate_from_belts(args.count, tier=tier)
+    except ValueError as e:
+        return _fail(str(e))
+    per_sec = result["items_per_sec"]
+    per_min = per_sec * 60.0
     print(
-        f"{args.item}: {verb} {_fmt_num(abs(n))}/min, {s} buffered in logistics, force '{args.force}'"
+        f"{_fmt_num(args.count)}x {result['tier']}  =  {_fmt_num(per_sec)}/s  =  {_fmt_num(per_min)}/min"
+    )
+    if tier_note is not None:
+        print(tier_note)
+    elif args.tier is None:
+        print(
+            f"(no --tier given and live tech-scoping unavailable — assumed the base/starter "
+            f"tier, {result['tier']}. Pass --tier explicitly, e.g. --tier fast-transport-belt "
+            "for a researched faster belt.)"
+        )
+    if not result["accurate"]:
+        print(
+            "(belt throughput constants are base/Space Age placeholders — see planner/throughput.py)"
+        )
+    print(
+        f"\nnext: `plan <product> --rate {_fmt_num(per_sec)}` to size a line for this input rate."
     )
     return 0
 
@@ -766,7 +1952,16 @@ async def cmd_have(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="planner",
-        description="flma factory planner — live flma game state x recipe-mcp recipe data",
+        description=(
+            "flma factory planner — live flma game state x recipe-mcp recipe data\n\n"
+            'For an open-ended "how do I make X" question, start with\n'
+            "`recommend <product>` — it picks the single best current way to make\n"
+            "something. `options`/`producers`/`recipe`/`tech` are for comparing\n"
+            "alternatives or inspecting a specific candidate once you already know\n"
+            "you need to override `recommend`'s pick; `plan`/`expand` build out the\n"
+            "chosen recipe into a sized production line."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -777,10 +1972,84 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", default="player", help="Factorio force to scope to (default: player)"
     )
 
+    p_options = sub.add_parser(
+        "options",
+        help=(
+            "compare every viable way to make a product side by side (the decision "
+            "menu behind `plan`/`expand`) — for a single best answer, use `recommend` instead"
+        ),
+    )
+    p_options.add_argument("product", help="item/fluid id or human name")
+    p_options.add_argument(
+        "--rate",
+        default=None,
+        help=(
+            "comparison yardstick, applied identically to every option so their raw "
+            "inputs/machines are comparable side by side (default: 60/min = 1/sec). A "
+            "bare number is interpreted per --unit; suffix it directly instead (e.g. "
+            "`15/s`, `900/min`) to set the unit inline and ignore --unit. Unlike "
+            "`plan`/`expand`, this does NOT default to '1 machine of the auto-picked "
+            "recipe' — different candidate recipes run at different speeds, so a "
+            "per-candidate default would make slow recipes look falsely cheap."
+        ),
+    )
+    p_options.add_argument(
+        "--unit",
+        choices=["per-sec", "per-min"],
+        default="per-sec",
+        help="unit for a --rate/--consume value with no /s or /min suffix of its own",
+    )
+    p_options.add_argument("--max-depth", type=int, default=6)
+    p_options.add_argument("--top", type=int, default=8, help="max raw inputs to show per option")
+    p_options.add_argument(
+        "--force", default="player", help="Factorio force to scope tech-status to (default: player)"
+    )
+    p_options.add_argument(
+        "--stop-items",
+        default=None,
+        help="comma-separated item ids to treat as raw inputs the user can already supply",
+    )
+    p_options.add_argument(
+        "--no-auto-stop-raw",
+        dest="auto_stop_raw",
+        action="store_false",
+        default=True,
+        help="see `plan --no-auto-stop-raw` — same real-mined-resource default here",
+    )
+    p_options.add_argument(
+        "--recipe",
+        default=None,
+        help="comma-separated ITEM=RECIPE overrides applied below the top-level choice",
+    )
+    p_options.add_argument(
+        "--include-byproducts",
+        action="store_true",
+        help=(
+            "also list recipes where the product is a low-probability byproduct "
+            "(not the recipe's main_product) or would need an absurd machine "
+            "count at the comparison yardstick — hidden by default"
+        ),
+    )
+
     p_plan = sub.add_parser("plan", help="design a production line for a target rate")
     p_plan.add_argument("product", help="item/fluid id or human name")
-    p_plan.add_argument("--rate", type=float, default=1.0)
-    p_plan.add_argument("--unit", choices=["per-sec", "per-min"], default="per-sec")
+    p_plan.add_argument(
+        "--rate",
+        default=None,
+        help=(
+            "target rate. A bare number is interpreted per --unit; suffix it directly "
+            "instead (e.g. `15/s`, `900/min`) to set the unit inline and ignore --unit. "
+            "If omitted, sizes the plan for exactly 1 of the top-level recipe's fastest "
+            "eligible machine instead of an arbitrary rate — the natural 'basic setup' "
+            "starting point ('just build one')."
+        ),
+    )
+    p_plan.add_argument(
+        "--unit",
+        choices=["per-sec", "per-min"],
+        default="per-sec",
+        help="unit for a --rate value with no /s or /min suffix of its own",
+    )
     p_plan.add_argument("--max-depth", type=int, default=6)
     p_plan.add_argument("--top", type=int, default=15, help="max raw inputs to show (default 15)")
     p_plan.add_argument(
@@ -831,8 +2100,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_expand = sub.add_parser("expand", help="full bill-of-materials tree for a product")
     p_expand.add_argument("product", help="item/fluid id or human name")
-    p_expand.add_argument("--rate", type=float, default=1.0)
-    p_expand.add_argument("--unit", choices=["per-sec", "per-min"], default="per-sec")
+    p_expand.add_argument(
+        "--rate",
+        default=None,
+        help=(
+            "target rate. A bare number is interpreted per --unit; suffix it directly "
+            "instead (e.g. `15/s`, `900/min`) to set the unit inline and ignore --unit. "
+            "If omitted, sizes for exactly 1 of the top-level recipe's fastest eligible "
+            "machine instead of an arbitrary rate."
+        ),
+    )
+    p_expand.add_argument(
+        "--unit",
+        choices=["per-sec", "per-min"],
+        default="per-sec",
+        help="unit for a --rate value with no /s or /min suffix of its own",
+    )
     p_expand.add_argument("--max-depth", type=int, default=6)
     p_expand.add_argument("--top", type=int, default=15, help="max raw totals to show (default 15)")
     p_expand.add_argument(
@@ -859,22 +2142,177 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="comma-separated ITEM=RECIPE overrides forcing a specific recipe per item",
     )
+    p_expand.add_argument(
+        "--alternates",
+        action="store_true",
+        help=(
+            "under each node, also list its other viable candidate recipes "
+            "(tagged available/tech_locked/excluded/stop_category) instead of "
+            "only the one auto-selected — see `options` for a higher-level "
+            "menu of top-level choices instead of this inline per-node view"
+        ),
+    )
 
-    p_recipe = sub.add_parser("recipe", help="full detail for one or more recipes")
+    p_recipe = sub.add_parser(
+        "recipe",
+        help=(
+            "full detail for one or more recipes you've already identified as "
+            "candidates — use `recommend`/`producers` first to find the id(s)"
+        ),
+    )
     p_recipe.add_argument("name", nargs="+", help="recipe id(s) or human name(s)")
+    p_recipe.add_argument(
+        "--force", default="player", help="Factorio force to scope tech-status to (default: player)"
+    )
 
-    p_producers = sub.add_parser("producers", help="what recipes produce this item (exact id)")
+    p_producers = sub.add_parser(
+        "producers",
+        help=(
+            "what recipes produce this item (exact id) — for a single best answer "
+            "use `recommend` instead; this is for manual comparison"
+        ),
+    )
     p_producers.add_argument("item")
+    p_producers.add_argument(
+        "--force", default="player", help="Factorio force to scope tech-status to (default: player)"
+    )
 
     p_consumers = sub.add_parser("consumers", help="what recipes consume this item (exact id)")
     p_consumers.add_argument("item")
+    p_consumers.add_argument(
+        "--force", default="player", help="Factorio force to scope tech-status to (default: player)"
+    )
 
     p_have = sub.add_parser(
-        "have", help="live net production + buffered stock for an item (exact id)"
+        "have", help="live net production + buffered stock for one or more items (exact id)"
     )
-    p_have.add_argument("item")
+    p_have.add_argument("item", nargs="+", help="item id(s)")
     p_have.add_argument(
         "--force", default="player", help="Factorio force to scope to (default: player)"
+    )
+
+    p_belts = sub.add_parser(
+        "belts", help="convert a belt-lane count to an achievable item rate (for `plan --rate`)"
+    )
+    p_belts.add_argument("count", type=float, help="number of belt lanes")
+    p_belts.add_argument(
+        "--tier",
+        default=None,
+        help=(
+            "belt tier id — transport-belt (vanilla 'yellow', 15/s), "
+            "fast-transport-belt ('red', 30/s), express-transport-belt ('blue', 45/s), "
+            "turbo-transport-belt (Space Age, 60/s, also called 'green'). If the user "
+            "names a belt by color/tier (e.g. 'a yellow belt'), pass the matching id "
+            "explicitly — default with no --tier is the fastest tier your current save "
+            f"can actually build (live tech-scoped), or the base/starter tier "
+            f"({throughput.DEFAULT_BELT_TIER_ORDER[0]}) if live tech state isn't available."
+        ),
+    )
+    p_belts.add_argument(
+        "--force",
+        default="player",
+        help="Factorio force to tech-scope the default tier to (default: player)",
+    )
+
+    p_tech = sub.add_parser(
+        "tech",
+        help=(
+            "what a technology unlocks, and whether the unlocked recipes combine into "
+            "a recycling bundle — `recommend` already calls this for you; use directly "
+            "only to inspect a bundle's math"
+        ),
+    )
+    p_tech.add_argument("name", help="technology id or human name")
+    p_tech.add_argument(
+        "--rate",
+        default=None,
+        help=(
+            "target rate for a detected bundle's anchor OUTPUT -- NOT the same thing as "
+            "a raw-input/consumption rate you're trying to fully use up (e.g. from "
+            "`belts`); the output:input ratio isn't 1:1, so don't plug an input rate in "
+            "here directly -- use --consume instead for that case. A bare number is "
+            "interpreted per --unit; suffix it directly instead (e.g. `15/s`, "
+            "`900/min`) to set the unit inline and ignore --unit. Default: 60/min "
+            "(1/sec) -- unlike `plan`/`expand`, a multi-recipe blend has no single "
+            "'one machine' to size against."
+        ),
+    )
+    p_tech.add_argument(
+        "--unit",
+        choices=["per-sec", "per-min"],
+        default="per-sec",
+        help="unit for a --rate/--consume value with no /s or /min suffix of its own",
+    )
+    p_tech.add_argument(
+        "--anchor",
+        default=None,
+        help=(
+            "force which external-output item to size a detected bundle against, "
+            "when it has more than one (default: the deepest/most-downstream one)"
+        ),
+    )
+    p_tech.add_argument(
+        "--consume",
+        default=None,
+        metavar="ITEM=RATE",
+        help=(
+            "size the bundle so ITEM (a raw/external INPUT, e.g. copper-ore) is fully "
+            "consumed at RATE instead of hitting an output target -- the answer to "
+            "'I have this many belts/units of a raw input, what do I need to consume "
+            "all of it?' without first having to work out the input:output ratio by "
+            "hand. RATE is interpreted per --unit unless it carries its own /s or /min "
+            "suffix (e.g. `copper-ore=15/s`, matching `belts`' own output format "
+            "directly). Overrides --rate/--anchor for any bundle that has ITEM as an "
+            "external input."
+        ),
+    )
+    p_tech.add_argument(
+        "--force", default="player", help="Factorio force to scope tech-status to (default: player)"
+    )
+
+    p_recommend = sub.add_parser(
+        "recommend",
+        help=(
+            "START HERE for open-ended asks — the single best way to make a "
+            "product right now — synthesizes `options` + `tech`"
+        ),
+    )
+    p_recommend.add_argument("product", help="item/fluid id or human name")
+    p_recommend.add_argument(
+        "--rate",
+        default=None,
+        help=(
+            "comparison yardstick, same default/semantics as `options` (60/min). A bare "
+            "number is interpreted per --unit; suffix it directly instead (e.g. `15/s`, "
+            "`900/min`) to set the unit inline and ignore --unit."
+        ),
+    )
+    p_recommend.add_argument(
+        "--unit",
+        choices=["per-sec", "per-min"],
+        default="per-sec",
+        help="unit for a --rate value with no /s or /min suffix of its own",
+    )
+    p_recommend.add_argument("--max-depth", type=int, default=6)
+    p_recommend.add_argument(
+        "--force", default="player", help="Factorio force to scope tech-status to (default: player)"
+    )
+    p_recommend.add_argument(
+        "--stop-items",
+        default=None,
+        help="comma-separated item ids to treat as raw inputs the user can already supply",
+    )
+    p_recommend.add_argument(
+        "--no-auto-stop-raw",
+        dest="auto_stop_raw",
+        action="store_false",
+        default=True,
+        help="see `plan --no-auto-stop-raw` — same real-mined-resource default here",
+    )
+    p_recommend.add_argument(
+        "--recipe",
+        default=None,
+        help="comma-separated ITEM=RECIPE overrides applied below the top-level choice",
     )
 
     return parser
@@ -882,12 +2320,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 _HANDLERS = {
     "status": cmd_status,
+    "options": cmd_options,
     "plan": cmd_plan,
     "expand": cmd_expand,
     "recipe": cmd_recipe,
     "producers": cmd_producers,
     "consumers": cmd_consumers,
     "have": cmd_have,
+    "belts": cmd_belts,
+    "tech": cmd_tech,
+    "recommend": cmd_recommend,
 }
 
 

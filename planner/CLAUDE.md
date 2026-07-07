@@ -13,8 +13,12 @@ raw-input rollup) is **not reimplemented here** — it's recipe-mcp's own
 both the MCP server and this CLI call the identical, already-tested code).
 `planner/` only adds what didn't exist anywhere: live-production netting,
 buffered-logistics-stock lookup, tech-scoping from the live save, belt/pipe
-count constants (recipes.json has no throughput data at all), a
-reuse-before-build report — `plan` cross-references the recipe chain's
+count constants (recipes.json has no throughput data at all),
+module-accelerated crafting-speed assumptions for specific building
+families the recipe DB has no module-bonus data for at all (see
+`planner/module_bonus.py`), a `plan --cap` mode that solves for the output
+rate keeping the worst raw input within a belt budget instead of picking an
+arbitrary rate first, a reuse-before-build report — `plan` cross-references the recipe chain's
 intermediate items and machine types against live production/buffered stock
 and `buildings.ndjson` counts, and prints what already exists so you're
 asked "reuse this?" instead of the tool silently assuming a from-scratch
@@ -77,6 +81,7 @@ uv run python -m planner tech "Copper processing - Stage 1" # what a tech unlock
 uv run python -m planner plan "processing unit" --rate 10 # rate is items/sec by default
 uv run python -m planner plan sand                        # no --rate: sizes for 1x the top-level machine instead
 uv run python -m planner plan sand --recipe sand=gravel-to-sand # force a specific recipe when the auto-pick is wrong
+uv run python -m planner plan battery-mk01 --cap 1        # solve for the rate where the worst raw input needs 1 belt
 uv run python -m planner have iron-plate                  # what am I already producing/storing?
 uv run python -m planner recipe sand-01 sand-02 sand-03    # compare several recipes in one call
 uv run python -m planner belts 2                          # N belts -> achievable rate, for `plan --rate`

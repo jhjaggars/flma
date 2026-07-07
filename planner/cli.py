@@ -30,7 +30,7 @@ import sys
 from collections import Counter
 from types import ModuleType
 
-from planner import config, live_state, techbundle, throughput
+from planner import config, live_state, module_bonus, techbundle, throughput
 from planner._recipe_mcp_loader import load_async_database_class, load_engine
 from planner.options import classify_producer, deeper_choices, tree_categories, tree_stages
 from planner.recommend import rank_candidates
@@ -236,14 +236,28 @@ async def _fastest_eligible_machine(
     machine without first picking a specific recipe (it needs this per
     *candidate* recipe, not just the auto-picked one). Returns None if no
     eligible machine exists."""
-    machine_rows = await engine.db.fetch_all(
-        """SELECT m.name, m.translated_name, m.crafting_speed
+    raw_rows = await engine.db.fetch_all(
+        """SELECT m.name, m.translated_name, m.crafting_speed, m.module_slots
            FROM machines m
            JOIN machine_crafting_categories mcc ON mcc.machine_name = m.name
-           WHERE mcc.category = ?
-           ORDER BY m.crafting_speed DESC""",
+           WHERE mcc.category = ?""",
         (category,),
     )
+    # Apply module_bonus before sorting/picking "fastest" -- for Moondrop
+    # greenhouses/Auog paddocks this can change which machine in a category
+    # is actually fastest once modules are assumed, not just the resulting
+    # count.
+    machine_rows: list[dict] = [
+        {
+            "name": r["name"],
+            "translated_name": r["translated_name"],
+            "crafting_speed": module_bonus.effective_speed(
+                r["name"], float(r["crafting_speed"]), int(r["module_slots"] or 0)
+            ),
+        }
+        for r in raw_rows
+    ]
+    machine_rows.sort(key=lambda m: m["crafting_speed"], reverse=True)
     if enforce_tech:
         eligible = []
         for m in machine_rows:
@@ -496,6 +510,90 @@ async def cmd_status(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+async def _apply_module_bonus_to_buildings(engine: ModuleType, buildings: list[dict]) -> list[dict]:
+    """Post-process `plan_product`'s aggregated building counts for the
+    module-accelerated families in module_bonus.py. plan_product's own
+    per-category machine selection (recipe-mcp's engine.py, not
+    reimplemented here) uses raw crafting_speed with no module assumption.
+    Its building counts are already summed across every recipe step using
+    that machine, each step's own math.ceil already applied — recovering the
+    *exact* post-module count would mean re-walking the recipe tree
+    ourselves. Dividing the aggregated (already-rounded-up) count by the
+    same multiplier and rounding up again is a very close approximation, off
+    by at most the number of distinct recipe steps sharing that machine
+    (typically 1 for these two families) — a tiny margin next to the
+    5-17x raw-speed overcount it corrects."""
+    ids = [b["id"] for b in buildings if module_bonus.is_module_accelerated(b["id"])]
+    if not ids:
+        return buildings
+    rows = await engine.db.fetch_all(
+        f"SELECT name, module_slots FROM machines WHERE name IN ({','.join('?' * len(ids))})",
+        tuple(ids),
+    )
+    slots_by_id = {r["name"]: int(r["module_slots"] or 0) for r in rows}
+    adjusted: list[dict] = []
+    for b in buildings:
+        slots = slots_by_id.get(b["id"], 0)
+        if slots > 0 and module_bonus.is_module_accelerated(b["id"]):
+            multiplier = 1.0 + slots * module_bonus.MODULE_SPEED_BONUS_PER_SLOT
+            adjusted.append(
+                {
+                    **b,
+                    "crafting_speed": b["crafting_speed"] * multiplier,
+                    "count": math.ceil(b["count"] / multiplier),
+                    "module_accelerated": True,
+                }
+            )
+        else:
+            adjusted.append(b)
+    return sorted(adjusted, key=lambda b: -b["count"])
+
+
+_CAP_REFERENCE_RATE_PER_MIN = 60.0
+
+
+async def _rate_for_belt_cap(
+    engine: ModuleType, product_id: str, max_depth: int, scoping: dict, cap_count: float
+) -> tuple[float, dict] | None:
+    """Solve for the rate_per_min where the raw input needing the most
+    logistics capacity (at a reference rate) needs exactly `cap_count`
+    belts/pipes -- the inverse of `plan`'s normal "pick a rate, see what it
+    needs" flow, for sizing against logistics capacity instead of an
+    arbitrary output target. A plan_product result's raw_inputs scale
+    linearly with rate_per_min for a fixed recipe selection (`_expand_node`'s
+    batch math has no rounding; only the final machine-count pass ceils), so
+    one reference call is enough to find the scale factor -- no need to
+    search/iterate. Uses throughput.capacity_needed (belts for items, pipes
+    for fluids -- see its docstring for why conflating the two badly skews
+    which raw input looks like "the bottleneck") the same way the `raw
+    inputs` section already prints, so the count reported here matches what
+    `plan` will show at the resulting rate. Returns None if the product has
+    no raw inputs to size a cap against (e.g. a fully closed loop)."""
+    reference = await engine.plan_product(
+        product_id, rate_per_min=_CAP_REFERENCE_RATE_PER_MIN, max_depth=max_depth, **scoping
+    )
+    raw_inputs = reference.get("raw_inputs") or []
+    if not raw_inputs:
+        return None
+
+    def _capacity(r: dict) -> float:
+        return float(throughput.capacity_needed(r["amount_per_min"] / 60.0, r["kind"])["count"])
+
+    bottleneck = max(raw_inputs, key=_capacity)
+    bottleneck_capacity = _capacity(bottleneck)
+    if bottleneck_capacity <= 0:
+        return None
+    rate_per_min = _CAP_REFERENCE_RATE_PER_MIN * (cap_count / bottleneck_capacity)
+    unit_plural = throughput.capacity_needed(
+        bottleneck["amount_per_min"] / 60.0, bottleneck["kind"]
+    )["unit_plural"]
+    return rate_per_min, {
+        "bottleneck_id": bottleneck["id"],
+        "bottleneck_name": bottleneck["name"],
+        "unit_plural": unit_plural,
+    }
+
+
 async def _plan_reuse_candidates(
     engine: ModuleType,
     args: argparse.Namespace,
@@ -582,7 +680,10 @@ def _print_plan_verbose(
     if not result["buildings"]:
         print("  (none)")
     for b in result["buildings"]:
-        print(f"  {b['count']:>5}x  {b['name']}  (speed {_fmt_num(b['crafting_speed'])})")
+        modules_note = "  [modules assumed]" if b.get("module_accelerated") else ""
+        print(
+            f"  {b['count']:>5}x  {b['name']}  (speed {_fmt_num(b['crafting_speed'])}){modules_note}"
+        )
 
     if result["blocked_categories"]:
         print("\nblocked (no eligible machine at current tech level):")
@@ -595,10 +696,10 @@ def _print_plan_verbose(
         print("  (none)")
     for r in raw_inputs[: args.top]:
         r_per_sec = r["amount_per_min"] / 60.0
-        belts = throughput.belts_needed(r_per_sec)
+        cap = throughput.capacity_needed(r_per_sec, r["kind"])
         line = (
             f"  {r['id']:<28} ({r['name']})  {_fmt_num(r['amount_per_min']):>10}/min"
-            f"  ({_fmt_num(belts['belts'])} {belts['tier']} belts)"
+            f"  ({_fmt_num(cap['count'])} {cap['unit_plural']})"
         )
         have_net = net.get(r["id"])
         have_stock = stock.get(r["id"])
@@ -733,6 +834,8 @@ def _print_plan_compact(
         flags.append(f"blocked-categories={len(result['blocked_categories'])}")
     if not throughput.VALUES_ARE_PYANODONS_ACCURATE:
         flags.append("belts=approximate")
+    if any(b.get("module_accelerated") for b in result["buildings"]):
+        flags.append("modules=assumed")
     if flags:
         print(f"flags: {', '.join(flags)}")
     print(
@@ -766,7 +869,23 @@ async def cmd_plan(args: argparse.Namespace) -> int:
     if recipe_overrides:
         scoping["recipe_overrides"] = recipe_overrides
 
-    if args.rate is None:
+    if args.rate is not None and args.cap is not None:
+        return _fail("--rate and --cap are mutually exclusive")
+
+    if args.cap is not None:
+        sizing = await _rate_for_belt_cap(engine, row["name"], args.max_depth, scoping, args.cap)
+        if sizing is None:
+            return _fail(
+                f"'{row['name']}' has no raw inputs to size a --cap against "
+                "— pass --rate explicitly"
+            )
+        rate_per_min, cap_info = sizing
+        print(
+            f"(--cap {_fmt_num(args.cap)} — bottleneck raw input "
+            f"{cap_info['bottleneck_id']} ({cap_info['bottleneck_name']}) capped at "
+            f"{_fmt_num(args.cap)} {cap_info['unit_plural']} -> {_fmt_num(rate_per_min)}/min)\n"
+        )
+    elif args.rate is None:
         extra_unlocked = await engine.unlocked_recipes_for_techs(scoping.get("assume_researched"))
         enforce_tech = scoping.get("only_enabled", False) or bool(extra_unlocked)
         sizing = await _one_machine_rate_per_min(
@@ -795,6 +914,7 @@ async def cmd_plan(args: argparse.Namespace) -> int:
     result = await engine.plan_product(
         row["name"], rate_per_min=rate_per_min, max_depth=args.max_depth, **scoping
     )
+    result["buildings"] = await _apply_module_bonus_to_buildings(engine, result["buildings"])
 
     net = live_state.net_production(gs, force=args.force) if align["aligned"] else {}
     stock = live_state.buffered_stock(gs, force=args.force) if align["aligned"] else {}
@@ -2049,6 +2169,20 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["per-sec", "per-min"],
         default="per-sec",
         help="unit for a --rate value with no /s or /min suffix of its own",
+    )
+    p_plan.add_argument(
+        "--cap",
+        type=float,
+        default=None,
+        help=(
+            "solve for the output rate where the raw input needing the most logistics "
+            "capacity (auto-picked -- whichever raw input needs the most belts if it's "
+            "an item, or pipes if it's a fluid, at a reference rate) needs exactly this "
+            "many belts/pipes (e.g. 1, or 0.5 for half a belt) -- 'how fast can I run "
+            "this without needing more than N belts/pipes of my worst input', instead of "
+            "picking an arbitrary output rate first and finding out logistics needs "
+            "second. Mutually exclusive with --rate."
+        ),
     )
     p_plan.add_argument("--max-depth", type=int, default=6)
     p_plan.add_argument("--top", type=int, default=15, help="max raw inputs to show (default 15)")

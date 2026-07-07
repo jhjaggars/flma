@@ -102,3 +102,24 @@ def pipes_needed(fluid_per_sec: float) -> dict[str, Any]:
         "pipes": fluid_per_sec / PIPE_THROUGHPUT_FLUID_PER_SEC,
         "accurate": VALUES_ARE_PYANODONS_ACCURATE,
     }
+
+
+def capacity_needed(amount_per_sec: float, kind: str, tier: str | None = None) -> dict[str, Any]:
+    """Dispatch to belts_needed (kind="item") or pipes_needed (kind="fluid")
+    -- a raw_inputs entry's own "kind" field (see engine.py's plan_product)
+    says which one actually applies. Fluids move through pipes (a single
+    rough per-segment figure, no tiers) rather than belts, and pipe
+    throughput (1200/sec) dwarfs even the fastest belt tier (60/sec) --
+    treating a fluid's amount as if it needed belts invents a fake
+    constraint for something that was never going belt, and can badly
+    distort anything that compares raw inputs by "how many belts/pipes does
+    this need" (e.g. `plan --cap`'s bottleneck auto-pick)."""
+    if kind == "fluid":
+        result = pipes_needed(amount_per_sec)
+        return {"count": result["pipes"], "unit_plural": "pipes", "accurate": result["accurate"]}
+    result = belts_needed(amount_per_sec, tier=tier)
+    return {
+        "count": result["belts"],
+        "unit_plural": f"{result['tier']} belts",
+        "accurate": result["accurate"],
+    }

@@ -38,3 +38,25 @@ class TestRateFromBelts:
         one = throughput.rate_from_belts(1.0, tier="transport-belt")
         two = throughput.rate_from_belts(2.0, tier="transport-belt")
         assert two["items_per_sec"] == pytest.approx(one["items_per_sec"] * 2)
+
+
+class TestCapacityNeeded:
+    def test_item_dispatches_to_belts(self) -> None:
+        result = throughput.capacity_needed(15.0, "item")
+        assert result["count"] == pytest.approx(
+            throughput.belts_needed(15.0)["belts"]
+        )
+        assert result["unit_plural"] == "transport-belt belts"
+
+    def test_fluid_dispatches_to_pipes(self) -> None:
+        result = throughput.capacity_needed(15.0, "fluid")
+        assert result["count"] == pytest.approx(throughput.pipes_needed(15.0)["pipes"])
+        assert result["unit_plural"] == "pipes"
+
+    def test_fluid_at_full_belt_rate_needs_far_fewer_pipes(self) -> None:
+        """15/sec is exactly 1 transport-belt's worth by belt math, but pipe
+        throughput (1200/sec) is 80x a single belt -- a fluid at this rate
+        should look like a tiny fraction of a pipe, not "1 belt"."""
+        item_capacity = throughput.capacity_needed(15.0, "item")["count"]
+        fluid_capacity = throughput.capacity_needed(15.0, "fluid")["count"]
+        assert fluid_capacity < item_capacity

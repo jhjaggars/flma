@@ -9,6 +9,7 @@ from planner.cli import (
     _is_tech_locked,
     _parse_rate_per_min,
     _print_tree,
+    _rate_for_belt_cap,
     _rate_per_min_or_default,
 )
 
@@ -155,6 +156,69 @@ class TestFastestBuildableBeltTier:
         )
         tier = await _fastest_buildable_belt_tier(engine, frozenset())
         assert tier is None
+
+
+class _FakePlanProductEngine:
+    """Duck-typed stand-in for recipe-mcp's engine module -- only the piece
+    `_rate_for_belt_cap` touches (engine.plan_product), returning a canned
+    raw_inputs list regardless of the requested rate_per_min (the real
+    engine's raw_inputs scale linearly with rate; `_rate_for_belt_cap` only
+    needs one reference call, so faking a single fixed response is enough
+    to test its scale-factor math in isolation)."""
+
+    def __init__(self, raw_inputs: list[dict]) -> None:
+        self._raw_inputs = raw_inputs
+
+    async def plan_product(self, product_id: str, *, rate_per_min: float, max_depth: int, **_scoping) -> dict:
+        return {"raw_inputs": self._raw_inputs}
+
+
+class TestRateForBeltCap:
+    async def test_scales_to_cap_the_bottleneck_input(self) -> None:
+        # transport-belt carries 900/min -- ore needs 5 belts, sand needs 2.
+        engine = _FakePlanProductEngine(
+            [
+                {"id": "ore", "name": "Ore", "amount_per_min": 4500.0, "kind": "item"},
+                {"id": "sand", "name": "Sand", "amount_per_min": 1800.0, "kind": "item"},
+            ]
+        )
+        result = await _rate_for_belt_cap(engine, "battery-mk01", 6, {}, cap_count=1.0)
+        assert result is not None
+        rate_per_min, info = result
+        assert rate_per_min == pytest.approx(12.0)
+        assert info["bottleneck_id"] == "ore"
+        assert info["unit_plural"] == "transport-belt belts"
+
+    async def test_half_belt_cap(self) -> None:
+        engine = _FakePlanProductEngine(
+            [{"id": "ore", "name": "Ore", "amount_per_min": 900.0, "kind": "item"}]
+        )
+        result = await _rate_for_belt_cap(engine, "x", 6, {}, cap_count=0.5)
+        assert result is not None
+        rate_per_min, _info = result
+        assert rate_per_min == pytest.approx(30.0)
+
+    async def test_none_when_no_raw_inputs(self) -> None:
+        engine = _FakePlanProductEngine([])
+        result = await _rate_for_belt_cap(engine, "closed-loop-item", 6, {}, cap_count=1.0)
+        assert result is None
+
+    async def test_fluid_input_uses_pipes_not_belts_for_the_bottleneck_pick(self) -> None:
+        """A fluid moving 900/min (15/sec) is a full transport-belt's worth
+        by belt math, but pipes carry 1200/sec -- 72000/min -- so it should
+        never out-rank a genuinely belt-constrained item input just because
+        it was mistakenly measured in belts."""
+        engine = _FakePlanProductEngine(
+            [
+                {"id": "water", "name": "Water", "amount_per_min": 900.0, "kind": "fluid"},
+                {"id": "ore", "name": "Ore", "amount_per_min": 1800.0, "kind": "item"},
+            ]
+        )
+        result = await _rate_for_belt_cap(engine, "x", 6, {}, cap_count=1.0)
+        assert result is not None
+        _rate_per_min, info = result
+        assert info["bottleneck_id"] == "ore"
+        assert info["unit_plural"] == "transport-belt belts"
 
 
 class TestParseRatePerMin:

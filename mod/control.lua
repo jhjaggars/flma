@@ -280,6 +280,14 @@ local function build_tech_table(force)
     research_progress = current and force.research_progress or nil,
     research_queue = research_queue_names(force),
     technologies = techs,
+    -- The engine's own running total of this force's mining-drill yield bonus
+    -- (e.g. 0.2 = +20% ore per mining operation, no extra energy/time cost) --
+    -- whatever mix of techs contributed to it (vanilla's single infinite
+    -- research, Pyanodons' many discrete mining-productivity-N techs, or any
+    -- other mod's effects), reading the force property directly is exact
+    -- where re-deriving it from individual tech effects would require picking
+    -- one hardcoded per-modpack formula and keeping it in sync by hand.
+    mining_drill_productivity_bonus = force.mining_drill_productivity_bonus,
   }
 end
 

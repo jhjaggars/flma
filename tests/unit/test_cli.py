@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pytest
 from planner.cli import (
+    _apply_mining_productivity_to_drills,
     _fastest_buildable_belt_tier,
     _is_tech_locked,
     _parse_rate_per_min,
@@ -259,3 +260,42 @@ class TestRatePerMinOrDefault:
 
     def test_value_delegates_to_parse_rate_per_min(self) -> None:
         assert _rate_per_min_or_default("15/s", "per-min") == pytest.approx(900.0)
+
+
+def _drill(drill_count: int, fluid_rate_per_min: float = 0.0) -> dict:
+    return {
+        "resource": "ore-lead",
+        "resource_category": "basic-with-fluid",
+        "drill_id": "fluid-drill-mk02",
+        "drill_name": "Fluid mining drill MK 02",
+        "drill_count": drill_count,
+        "required_fluid": "acetylene" if fluid_rate_per_min else None,
+        "fluid_rate_per_min": fluid_rate_per_min,
+        "approximate": True,
+        "note": "Ignores purity and productivity bonuses",
+    }
+
+
+class TestApplyMiningProductivityToDrills:
+    def test_zero_bonus_is_a_no_op(self) -> None:
+        drills = [_drill(15, 90000.0)]
+        assert _apply_mining_productivity_to_drills(drills, 0.0) is drills
+
+    def test_bonus_reduces_drill_count_and_fluid_rate(self) -> None:
+        # +20% yield per mining cycle -> ~1/1.2 as many drills/fluid needed
+        # for the same ore/min.
+        drills = [_drill(15, 90000.0)]
+        adjusted = _apply_mining_productivity_to_drills(drills, 0.2)
+        assert adjusted[0]["drill_count"] == 13  # ceil(15 / 1.2)
+        assert adjusted[0]["fluid_rate_per_min"] == pytest.approx(75000.0)
+
+    def test_note_records_the_applied_bonus(self) -> None:
+        drills = [_drill(15)]
+        adjusted = _apply_mining_productivity_to_drills(drills, 0.2)
+        assert "+20%" in adjusted[0]["note"]
+
+    def test_original_drills_list_is_untouched(self) -> None:
+        drills = [_drill(15, 90000.0)]
+        _apply_mining_productivity_to_drills(drills, 0.2)
+        assert drills[0]["drill_count"] == 15
+        assert drills[0]["fluid_rate_per_min"] == 90000.0

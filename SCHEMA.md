@@ -102,7 +102,8 @@ stale between events; use `research.json` for the live value.
           "enabled": true,
           "prerequisites": ["plastics"]
         }
-      }
+      },
+      "mining_drill_productivity_bonus": 0.2
     }
   }
 }
@@ -115,6 +116,13 @@ stale between events; use `research.json` for the live value.
   `prerequisites` are researched — the file doesn't precompute that;
   consumers derive it (see `get_tech_tree` in `src/server.py`).
 - `level` — current level, only meaningful for repeatable/leveled techs.
+- `mining_drill_productivity_bonus` — the force's current mining-drill yield
+  bonus (`LuaForce::mining_drill_productivity_bonus`; e.g. `0.2` = +20% ore
+  per mining operation, same energy/time cost). Read straight from the engine
+  rather than summed from individual tech effects, so it's correct no matter
+  which technologies (vanilla's single infinite research, Pyanodons' many
+  discrete `mining-productivity-N` techs, or any other mod) contributed to
+  it. Absent (mod build predates 0.3.2) should be treated as `0`.
 
 ## `research.json`
 

@@ -1,4 +1,12 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.2
+Date: 2026-07-07
+  Changes:
+    - tech.json per-force entries now include mining_drill_productivity_bonus
+      (the force's current mining-drill yield bonus, e.g. 0.2 = +20% ore per
+      mining operation), read straight from LuaForce so it stays correct
+      regardless of which technologies contributed to it.
+---------------------------------------------------------------------------------------------------
 Version: 0.3.1
 Date: 2026-07-02
   Changes:

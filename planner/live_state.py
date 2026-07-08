@@ -34,6 +34,18 @@ def researched_technologies(gs: GameState, force: str = "player") -> list[str]:
     return [name for name, t in technologies.items() if t.get("researched")]
 
 
+def mining_drill_productivity_bonus(gs: GameState, force: str = "player") -> float:
+    """`force`'s current mining-drill yield bonus (e.g. 0.2 = +20% ore per
+    mining operation, no extra energy/time cost), straight off the live
+    tech.json. Defaults to 0.0 if absent — either an older mod build that
+    predates this field, or a force with no bonus at all — since that's the
+    correct no-op value for any caller dividing a raw drill count by
+    `1 + bonus`."""
+    tech = gs.get_tech()
+    force_data = tech.get("forces", {}).get(force, {})
+    return float(force_data.get("mining_drill_productivity_bonus") or 0.0)
+
+
 def net_production(gs: GameState, force: str = "player") -> dict[str, float]:
     """Net production rate (input - output) per item/fluid id, in units per
     minute, summed across all of `force`'s surfaces. Positive = net surplus

@@ -82,6 +82,7 @@ uv run python -m planner plan "processing unit" --rate 10 # rate is items/sec by
 uv run python -m planner plan sand                        # no --rate: sizes for 1x the top-level machine instead
 uv run python -m planner plan sand --recipe sand=gravel-to-sand # force a specific recipe when the auto-pick is wrong
 uv run python -m planner plan battery-mk01 --cap 1        # solve for the rate where the worst raw input needs 1 belt
+uv run python -m planner plan ore-lead --belts 1           # size drills/machines for N belts of the item itself
 uv run python -m planner have iron-plate                  # what am I already producing/storing?
 uv run python -m planner recipe sand-01 sand-02 sand-03    # compare several recipes in one call
 uv run python -m planner belts 2                          # N belts -> achievable rate, for `plan --rate`

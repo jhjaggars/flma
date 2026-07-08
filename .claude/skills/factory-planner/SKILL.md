@@ -54,6 +54,7 @@ uv run python -m planner plan "processing unit" --rate 10     # rate is items/se
 uv run python -m planner plan sand                            # no --rate: sizes for 1x the top-level recipe's machine instead
 uv run python -m planner plan iron-plate --rate 2 --stop-items iron-ore
 uv run python -m planner plan sand --rate 1 --recipe sand=gravel-to-sand  # force a specific recipe
+uv run python -m planner plan ore-lead --belts 1               # size drills for N belts of a raw resource itself
 uv run python -m planner expand iron-plate --rate 2 --stop-items iron-ore
 uv run python -m planner expand copper-plate --alternates       # inline per-node alternates instead of `options`' menu view
 uv run python -m planner recipe electronic-circuit

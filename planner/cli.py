@@ -549,6 +549,34 @@ async def _apply_module_bonus_to_buildings(engine: ModuleType, buildings: list[d
     return sorted(adjusted, key=lambda b: -b["count"])
 
 
+def _apply_mining_productivity_to_drills(drills: list[dict], bonus: float) -> list[dict]:
+    """Post-process `plan_product`'s drill counts for the live mining-drill
+    productivity bonus (planner/live_state.py's
+    mining_drill_productivity_bonus) — recipe-mcp's engine.py (not
+    reimplemented here) computes drill_count from the raw mining_speed/
+    mining_time ratio with no productivity assumption at all (each entry's
+    own `note` field says so). A productivity bonus means every mining cycle
+    yields (1 + bonus) output for the same fluid/time cost, so both
+    drill_count and fluid_rate_per_min scale down by the same factor.
+    Dividing the already-rounded-up drill_count by that factor and rounding
+    up again is the same approximation `_apply_module_bonus_to_buildings`
+    makes for module-accelerated buildings, for the same reason: recovering
+    the exact post-bonus count would mean re-deriving mining_time/
+    mining_speed ourselves instead of reusing engine.py's own numbers."""
+    if bonus <= 0:
+        return drills
+    factor = 1.0 + bonus
+    return [
+        {
+            **d,
+            "drill_count": math.ceil(d["drill_count"] / factor),
+            "fluid_rate_per_min": d["fluid_rate_per_min"] / factor,
+            "note": f"{d['note']} (mining-productivity +{bonus * 100:.0f}% applied)",
+        }
+        for d in drills
+    ]
+
+
 _CAP_REFERENCE_RATE_PER_MIN = 60.0
 
 
@@ -738,7 +766,16 @@ def _print_plan_verbose(
             print(f"  {note}")
 
     if result["drills"]:
-        print("\ndrills (approximate — ignores purity/productivity bonuses):")
+        bonus = result.get("mining_drill_productivity_bonus", 0.0)
+        if bonus > 0:
+            print(
+                f"\ndrills (mining-productivity +{bonus * 100:.0f}% applied "
+                "— still ignores drill modules/resource richness):"
+            )
+        else:
+            print(
+                "\ndrills (approximate — ignores modules/resource richness/productivity bonuses):"
+            )
         by_resource = Counter(d["resource"] for d in result["drills"])
         for d in result["drills"]:
             line = f"  {d['drill_count']:>5}x  {d['drill_name']}  for {d['resource']}"
@@ -836,6 +873,8 @@ def _print_plan_compact(
         flags.append("belts=approximate")
     if any(b.get("module_accelerated") for b in result["buildings"]):
         flags.append("modules=assumed")
+    if result.get("mining_drill_productivity_bonus"):
+        flags.append(f"mining-productivity=+{result['mining_drill_productivity_bonus'] * 100:.0f}%")
     if flags:
         print(f"flags: {', '.join(flags)}")
     print(
@@ -869,10 +908,26 @@ async def cmd_plan(args: argparse.Namespace) -> int:
     if recipe_overrides:
         scoping["recipe_overrides"] = recipe_overrides
 
-    if args.rate is not None and args.cap is not None:
-        return _fail("--rate and --cap are mutually exclusive")
+    if sum(x is not None for x in (args.rate, args.cap, args.belts)) > 1:
+        return _fail("--rate, --cap, and --belts are mutually exclusive")
 
-    if args.cap is not None:
+    if args.belts is not None:
+        tier = args.belt_tier
+        if tier is None and align["aligned"]:
+            belt_extra_unlocked = await engine.unlocked_recipes_for_techs(
+                live_state.researched_technologies(gs, force=args.force)
+            )
+            tier = await _fastest_buildable_belt_tier(engine, belt_extra_unlocked)
+        try:
+            belt_result = throughput.rate_from_belts(args.belts, tier=tier)
+        except ValueError as e:
+            return _fail(str(e))
+        rate_per_min = belt_result["items_per_sec"] * 60.0
+        print(
+            f"(--belts {_fmt_num(args.belts)} {belt_result['tier']} -> "
+            f"{_fmt_num(rate_per_min)}/min of {row['name']})\n"
+        )
+    elif args.cap is not None:
         sizing = await _rate_for_belt_cap(engine, row["name"], args.max_depth, scoping, args.cap)
         if sizing is None:
             return _fail(
@@ -915,6 +970,9 @@ async def cmd_plan(args: argparse.Namespace) -> int:
         row["name"], rate_per_min=rate_per_min, max_depth=args.max_depth, **scoping
     )
     result["buildings"] = await _apply_module_bonus_to_buildings(engine, result["buildings"])
+    mining_bonus = live_state.mining_drill_productivity_bonus(gs, force=args.force)
+    result["drills"] = _apply_mining_productivity_to_drills(result["drills"], mining_bonus)
+    result["mining_drill_productivity_bonus"] = mining_bonus
 
     net = live_state.net_production(gs, force=args.force) if align["aligned"] else {}
     stock = live_state.buffered_stock(gs, force=args.force) if align["aligned"] else {}
@@ -2182,6 +2240,28 @@ def build_parser() -> argparse.ArgumentParser:
             "this without needing more than N belts/pipes of my worst input', instead of "
             "picking an arbitrary output rate first and finding out logistics needs "
             "second. Mutually exclusive with --rate."
+        ),
+    )
+    p_plan.add_argument(
+        "--belts",
+        type=float,
+        default=None,
+        help=(
+            "target rate expressed as a belt-lane count of `product` itself (e.g. "
+            "`--belts 1` sizes for exactly one full belt of this item) instead of an "
+            "items/min rate -- the composed form of `belts <n>` piped into `--rate`. "
+            "Most useful on a raw resource (e.g. an ore) to size mining drills for a "
+            "given number of belts of it. Mutually exclusive with --rate/--cap."
+        ),
+    )
+    p_plan.add_argument(
+        "--belt-tier",
+        default=None,
+        help=(
+            "belt tier for --belts -- same tier ids as `belts --tier` (transport-belt/"
+            "fast-transport-belt/express-transport-belt/turbo-transport-belt). Default: "
+            "the fastest tier your current save can build (live tech-scoped), or the "
+            "base/starter tier if live tech state isn't available."
         ),
     )
     p_plan.add_argument("--max-depth", type=int, default=6)

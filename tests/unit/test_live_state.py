@@ -177,3 +177,31 @@ class TestBuildingCounts:
         gs = GameState(tmp_path, min_refresh_interval=0)
         counts = live_state.building_counts(gs, force="player")
         assert counts == {}
+
+
+class TestMiningDrillProductivityBonus:
+    def test_reads_the_live_value(self, tmp_path: Path) -> None:
+        write_json(
+            tmp_path / "tech.json",
+            {"tick": 1, "forces": {"player": {"mining_drill_productivity_bonus": 0.2}}},
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert live_state.mining_drill_productivity_bonus(gs) == pytest.approx(0.2)
+
+    def test_missing_field_defaults_to_zero(self, tmp_path: Path) -> None:
+        # Older mod builds (pre-0.3.2) never write this field at all.
+        write_json(tmp_path / "tech.json", {"tick": 1, "forces": {"player": {}}})
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert live_state.mining_drill_productivity_bonus(gs) == 0.0
+
+    def test_no_tech_file_defaults_to_zero(self, tmp_path: Path) -> None:
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert live_state.mining_drill_productivity_bonus(gs) == 0.0
+
+    def test_unknown_force_defaults_to_zero(self, tmp_path: Path) -> None:
+        write_json(
+            tmp_path / "tech.json",
+            {"tick": 1, "forces": {"player": {"mining_drill_productivity_bonus": 0.2}}},
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert live_state.mining_drill_productivity_bonus(gs, force="enemy") == 0.0

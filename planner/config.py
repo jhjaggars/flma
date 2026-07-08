@@ -7,16 +7,16 @@ from pathlib import Path
 
 from src.config import SCRIPT_OUTPUT_DIR  # flma's own live-snapshot directory
 
-# The homelab checkout containing recipe-mcp. Used to (a) locate its built
-# recipes.db and (b) import its engine.py calculation logic directly (see
-# planner/_recipe_mcp_loader.py). This tool is single-machine, single-user
-# local tooling, so it references that checkout in place rather than
-# vendoring a copy of the recipe data or the engine code — see CLAUDE.md's
-# factory-planner section for the reasoning.
+# The recipe-mcp checkout (github.com/jhjaggars/recipe-mcp, a standalone
+# sibling project). Used to (a) locate its built recipes.db and (b) import
+# its engine.py calculation logic directly (see planner/_recipe_mcp_loader.py).
+# This tool is single-machine, single-user local tooling, so it references
+# that checkout in place rather than vendoring a copy of the recipe data or
+# the engine code — see CLAUDE.md's factory-planner section for the reasoning.
 RECIPE_MCP_DIR: Path = Path(
     os.environ.get(
         "RECIPE_MCP_DIR",
-        str(Path.home() / "code" / "homelab" / "apps" / "recipe-mcp"),
+        str(Path.home() / "code" / "recipe-mcp"),
     )
 )
 

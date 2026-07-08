@@ -3,8 +3,9 @@
 A local CLI — **no MCP server, no Hermes** — that answers "how do I build a
 production line for X at rate Y, and what am I already producing toward it?"
 by combining this repo's live game state with `recipe-mcp`'s static
-recipe/machine data (`~/code/homelab/apps/recipe-mcp`, a sibling project —
-its `recipes.json` is a dump from the **RecipeExporter** Factorio mod).
+recipe/machine data ([github.com/jhjaggars/recipe-mcp](https://github.com/jhjaggars/recipe-mcp),
+a standalone sibling project — `~/code/recipe-mcp` — its `recipes.json` is a
+dump from the **RecipeExporter** Factorio mod).
 
 The heavy arithmetic (recipe-chain expansion, batches → machine counts,
 raw-input rollup) is **not reimplemented here** — it's recipe-mcp's own
@@ -88,7 +89,7 @@ uv run python -m planner recipe sand-01 sand-02 sand-03    # compare several rec
 uv run python -m planner belts 2                          # N belts -> achievable rate, for `plan --rate`
 ```
 
-Config: `RECIPE_MCP_DIR` (default `~/code/homelab/apps/recipe-mcp`),
+Config: `RECIPE_MCP_DIR` (default `~/code/recipe-mcp`),
 `RECIPES_DB` (default `$RECIPE_MCP_DIR/recipes.db` — build once via
 `cd $RECIPE_MCP_DIR && make build-db`). Reuses this repo's own
 `SCRIPT_OUTPUT_DIR` for live state.
@@ -100,7 +101,7 @@ As of mod 0.3.0 the flma mod itself exports a RecipeExporter-compatible
 workflow is to build the DB from the live export:
 
 ```bash
-cd ~/code/homelab/apps/recipe-mcp && \
+cd ~/code/recipe-mcp && \
   uv run python -m src.build_db ~/.factorio/script-output/flma/recipes.json recipes.db
 ```
 

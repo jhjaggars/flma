@@ -109,7 +109,7 @@ of all handlers when disabled. Details in [CLAUDE.md](CLAUDE.md).
 | `mod/` | producer | the Factorio mod — self-contained, Lua only |
 | `SCHEMA.md` | contract | exact format of every exported file |
 | `src/` | consumer | the MCP bridge (FastMCP, Streamable HTTP) |
-| `planner/` | consumer | factory-planner CLI (needs a sibling [recipe-mcp](../homelab/apps/recipe-mcp) checkout) |
+| `planner/` | consumer | factory-planner CLI (needs a sibling [recipe-mcp](https://github.com/jhjaggars/recipe-mcp) checkout, e.g. `~/code/recipe-mcp`) |
 | `dev/` | mod dev | isolated local server+client environment for developing the mod |
 | `.claude/skills/` | dev | Claude Code skills for mod development and the planner |
 

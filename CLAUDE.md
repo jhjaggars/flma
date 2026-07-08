@@ -69,7 +69,7 @@ npx @modelcontextprotocol/inspector http://localhost:8080/mcp
 # Preferred source: flma's own live export (guaranteed to match the running
 # save, see SCHEMA.md `recipes.json`); `make build-db` uses recipe-mcp's
 # committed static dump instead.
-cd ~/code/homelab/apps/recipe-mcp && \
+cd ~/code/recipe-mcp && \
   uv run python -m src.build_db ~/.factorio/script-output/flma/recipes.json recipes.db
 uv run python -m planner status
 ```

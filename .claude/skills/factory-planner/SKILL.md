@@ -305,8 +305,9 @@ ungated fallback).
 
 Two env vars (both optional, sensible defaults):
 
-- `RECIPE_MCP_DIR` — path to the `recipe-mcp` checkout. Default:
-  `~/code/homelab/apps/recipe-mcp`.
+- `RECIPE_MCP_DIR` — path to the `recipe-mcp` checkout
+  ([github.com/jhjaggars/recipe-mcp](https://github.com/jhjaggars/recipe-mcp)).
+  Default: `~/code/recipe-mcp`.
 - `RECIPES_DB` — path to its built `recipes.db`. Default:
   `$RECIPE_MCP_DIR/recipes.db`. Not committed to either repo — build it with
   `cd $RECIPE_MCP_DIR && make build-db` before first use (needs

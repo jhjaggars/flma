@@ -88,6 +88,46 @@ dependency) and the setup steps.
 > "How many logistic bots are idle on Nauvis?"
 > "Where are my rocket silos?"
 
+## Example session
+
+The CLI is what an agent runs under the hood — here's what it looks like
+run by hand:
+
+```console
+$ flma-planner status
+recipes.db     : /home/jhjaggars/code/recipe-mcp/recipes.db  (312 technologies)
+flma live data : /home/jhjaggars/.factorio/script-output/flma
+  tech        : 3s ago
+  production  : 3s ago
+  logistics   : 8s ago
+  buildings   : 41s ago
+force 'player'   : 87 technologies known, current research: automation-3
+
+modpack alignment: OK (309/312 live techs found in recipes.db)
+`plan`/`have` live-scoping and netting are meaningful for this save.
+
+next: `recommend <product>` for the single best way to make something right now; `plan <product> --rate <n>` to design a line; `have <item>` to check current production.
+
+$ flma-planner research
+force 'player' — current research: automation-3
+  progress: 42.7%
+  queue (2): automation-3, logistic-system
+
+$ flma-planner production --kind items
+force 'player', surface 'nauvis'
+
+items (produced +/consumed -, per minute):
+  copper-plate                                  +   842.0  -   790.5
+  iron-plate                                    +  1200.0  - 1150.2
+
+$ flma-planner plan electronic-circuit --rate 20
+plan: electronic-circuit @ 1200.0/min (20.0/s)
+machines: 24x assembling-machine-1
+raw inputs: iron-plate (Iron plate) 600.0/min, copper-plate (Copper plate) 600.0/min
+reuse candidates (production): copper-plate(842.0/min live)
+flags: belts=approximate
+```
+
 ## What the agent can see
 
 | Command | Answers |

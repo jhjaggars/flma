@@ -47,19 +47,39 @@ data export.
 `flma-export-inventories` (player inventories, off by default for privacy).
 Confirm `~/.factorio/script-output/flma/tech.json` appears.
 
-**3. Query it**, on the same machine as your Factorio client:
+**3. Query it**, on the same machine as your Factorio client. No server to
+start — each command is a one-shot read of the exported snapshot files.
+Three ways to run the CLI, in increasing order of permanence:
 
 ```bash
+# a) uvx, straight from GitHub -- no install, no clone, nothing left behind
+uvx --from git+https://github.com/jhjaggars/flma flma-planner research
+uvx --from git+https://github.com/jhjaggars/flma flma-planner production --kind items
+
+# b) uv tool install -- puts `flma-planner` on PATH persistently (like pipx)
+uv tool install git+https://github.com/jhjaggars/flma
+flma-planner status   # feed staleness + modpack alignment
+
+# c) from a clone, for development or to also get the mod/dev/ tooling
 uv sync
-SCRIPT_OUTPUT_DIR=~/.factorio/script-output/flma uv run python -m planner research
-uv run python -m planner production --kind items
-uv run python -m planner status   # feed staleness + modpack alignment
+uv run python -m planner research
 ```
 
-No server to start — each command is a one-shot read of the exported
-snapshot files. Point Claude Code (or any agent that can run a shell and read
-AgentSkills) at this repo and it picks up the `factorio-live` and
-`factory-planner` skills, which teach it the full command surface.
+`SCRIPT_OUTPUT_DIR` defaults to `~/.factorio/script-output/flma`; set it if
+your Factorio config dir is elsewhere. Point Claude Code (or any agent that
+can run a shell and read AgentSkills) at a clone of this repo and it picks up
+the `factorio-live` and `factory-planner` skills, which teach it the full
+command surface — the skills assume `uv run python -m planner ...` from a
+checkout, since an agent working on/against this repo already has one.
+
+The live-observe commands above (`research`, `tech-tree`, `production`,
+`logistics`, `inventory`, `buildings`, `status`) work with just the mod
+enabled — no other setup. The factory-planning commands (`plan`, `options`,
+`recommend`, `tech`, …) additionally need a local
+[recipe-mcp](https://github.com/jhjaggars/recipe-mcp) checkout with its
+recipe DB built, regardless of how you installed flma itself — see
+`planner/CLAUDE.md` for why (a filesystem-path import, not a package
+dependency) and the setup steps.
 
 **4. Ask questions.**
 

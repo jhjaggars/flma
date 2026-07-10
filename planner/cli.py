@@ -139,7 +139,7 @@ def _make_engine() -> ModuleType | None:
         print(
             f"error: recipes.db not found at {config.RECIPES_DB}\n"
             f"  build it first: cd {config.RECIPE_MCP_DIR} && make build-db\n"
-            f"  (or set RECIPES_DB / RECIPE_MCP_DIR if the homelab checkout is elsewhere)",
+            f"  (or set RECIPES_DB / RECIPE_MCP_DIR if the recipe-mcp checkout is elsewhere)",
             file=sys.stderr,
         )
         return None

@@ -1,14 +1,15 @@
 """Imports recipe-mcp's `src` package (engine.py + db.py) under a distinct
 module name.
 
-recipe-mcp (a sibling project, normally checked out at
-~/code/homelab/apps/recipe-mcp) names its own package `src` — same as flma's
-own `src/`. A plain `import src.engine` would silently resolve to whichever
-`src` package Python's import system already has cached (almost certainly
-flma's, since it's imported first), not recipe-mcp's. Instead, this module
-loads recipe-mcp's `src/` directory under the distinct name `recipe_mcp_src`
-via `importlib`, so its internal `from .db import ...` / `from .config
-import ...` relative imports keep resolving correctly, unmodified.
+recipe-mcp ([github.com/jhjaggars/recipe-mcp](https://github.com/jhjaggars/recipe-mcp),
+a standalone sibling project, normally checked out at ~/code/recipe-mcp)
+names its own package `src` — same as flma's own `src/`. A plain `import
+src.engine` would silently resolve to whichever `src` package Python's
+import system already has cached (almost certainly flma's, since it's
+imported first), not recipe-mcp's. Instead, this module loads recipe-mcp's
+`src/` directory under the distinct name `recipe_mcp_src` via `importlib`,
+so its internal `from .db import ...` / `from .config import ...` relative
+imports keep resolving correctly, unmodified.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ def _ensure_package_loaded(recipe_mcp_dir: Path) -> None:
     if not init_path.exists():
         raise FileNotFoundError(
             f"recipe-mcp package not found at {pkg_dir} "
-            f"(set RECIPE_MCP_DIR if the homelab checkout is elsewhere)"
+            f"(set RECIPE_MCP_DIR if the recipe-mcp checkout is elsewhere)"
         )
 
     spec = importlib.util.spec_from_file_location(

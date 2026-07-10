@@ -3,7 +3,12 @@ state — pure string/data formatting logic."""
 
 from __future__ import annotations
 
+import argparse
+import json
+from pathlib import Path
+
 import pytest
+from planner import cli, config
 from planner.cli import (
     _apply_mining_productivity_to_drills,
     _fastest_buildable_belt_tier,
@@ -15,6 +20,10 @@ from planner.cli import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def write_json(path: Path, data: dict) -> None:
+    path.write_text(json.dumps(data), encoding="utf-8")
 
 
 class TestIsTechLocked:
@@ -299,3 +308,107 @@ class TestApplyMiningProductivityToDrills:
         _apply_mining_productivity_to_drills(drills, 0.2)
         assert drills[0]["drill_count"] == 15
         assert drills[0]["fluid_rate_per_min"] == 90000.0
+
+
+class TestLiveObserveCommands:
+    """Smoke tests for the research/tech-tree/production/logistics/inventory/
+    buildings subcommands -- these only need GameState (config.SCRIPT_OUTPUT_DIR
+    pointed at a fixture dir), no recipe DB engine."""
+
+    def _point_at(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(config, "SCRIPT_OUTPUT_DIR", tmp_path)
+
+    async def test_research_json_output(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._point_at(monkeypatch, tmp_path)
+        write_json(
+            tmp_path / "tech.json",
+            {
+                "tick": 1,
+                "forces": {
+                    "player": {
+                        "current_research": "automation-2",
+                        "research_progress": 0.5,
+                        "research_queue": [],
+                        "technologies": {},
+                    }
+                },
+            },
+        )
+        args = argparse.Namespace(force="player", json=True)
+        assert await cli.cmd_research(args) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["current_research"] == "automation-2"
+
+    async def test_research_text_output_on_no_data(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._point_at(monkeypatch, tmp_path)
+        args = argparse.Namespace(force="player", json=False)
+        assert await cli.cmd_research(args) == 1
+        assert "error" in capsys.readouterr().err
+
+    async def test_tech_tree_status_filter(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._point_at(monkeypatch, tmp_path)
+        write_json(
+            tmp_path / "tech.json",
+            {
+                "tick": 1,
+                "forces": {
+                    "player": {
+                        "technologies": {
+                            "a": {"researched": True, "enabled": True, "prerequisites": []},
+                            "b": {"researched": False, "enabled": True, "prerequisites": []},
+                        }
+                    }
+                },
+            },
+        )
+        args = argparse.Namespace(force="player", status="researched", json=True)
+        assert await cli.cmd_tech_tree(args) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["count"] == 1
+
+    async def test_production_json_output(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._point_at(monkeypatch, tmp_path)
+        write_json(
+            tmp_path / "production.json",
+            {
+                "tick": 1,
+                "forces": {
+                    "player": {
+                        "surfaces": {
+                            "nauvis": {
+                                "items": {
+                                    "input_counts": {},
+                                    "output_counts": {},
+                                    "input_rates_per_min": {"iron-plate": 120.0},
+                                    "output_rates_per_min": {},
+                                },
+                                "fluids": {"input_counts": {}, "output_counts": {}},
+                            }
+                        }
+                    }
+                },
+            },
+        )
+        args = argparse.Namespace(force="player", surface=None, kind="both", json=False)
+        assert await cli.cmd_production(args) == 0
+        out = capsys.readouterr().out
+        assert "iron-plate" in out
+
+    async def test_buildings_counts_mode(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._point_at(monkeypatch, tmp_path)
+        args = argparse.Namespace(
+            name=None, type=None, surface=None, force=None, list=False, limit=100, json=True
+        )
+        assert await cli.cmd_buildings(args) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["total"] == 0

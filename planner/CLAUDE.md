@@ -89,6 +89,17 @@ uv run python -m planner recipe sand-01 sand-02 sand-03    # compare several rec
 uv run python -m planner belts 2                          # N belts -> achievable rate, for `plan --rate`
 ```
 
+**Live-observe commands** (`planner/observe.py`, behind the `research` /
+`tech-tree` / `production` / `logistics` / `inventory` / `buildings`
+subcommands) read the running game's state directly — no recipe-chain math,
+no DB involved. These replaced `src/server.py`'s former MCP tools of the
+same shapes (`get_research_status`, `get_tech_tree`, `get_production_stats`,
+`get_logistics`, `get_player_inventory`, `get_building_counts`/
+`query_buildings`) when the MCP bridge was removed in favor of a single CLI +
+skills, since the only consumer has ever been Claude Code. See
+`.claude/skills/factorio-live/SKILL.md` for the workflow guide; every command
+accepts `--json` for machine-readable output.
+
 Config: `RECIPE_MCP_DIR` (default `~/code/recipe-mcp`),
 `RECIPES_DB` (default `$RECIPE_MCP_DIR/recipes.db` — build once via
 `cd $RECIPE_MCP_DIR && make build-db`). Reuses this repo's own
@@ -120,8 +131,8 @@ for the full workflow guide and caveats.
   import would silently resolve to whichever one Python already cached.
 - `planner/live_state.py` computes net production (output − input, summed
   across surfaces) and buffered logistics stock — this math doesn't exist
-  anywhere else; `src/server.py`'s `get_production_stats` only passes the
-  raw per-surface counts through untouched.
+  anywhere else; `planner/observe.py`'s `production_stats` (the `production`
+  command) only passes the raw per-surface counts through untouched.
 - `engine.py` in recipe-mcp was extracted from `server.py` specifically so
   both the MCP server and this CLI call the *same* calculation code — see
   that repo's `server.py` module docstring and `plan_factory`'s thin-wrapper

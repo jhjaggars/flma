@@ -106,7 +106,7 @@ class TestBuildingIndex:
         self, tmp_path: Path
     ) -> None:
         # A size-only check misses a compaction that rewrites the file to a
-        # size at or above our current offset -- the bridge would then
+        # size at or above our current offset -- a consumer would then
         # resume reading at the old byte offset into unrelated new content.
         # BuildingIndex additionally fingerprints the file's leading bytes,
         # which always change on compaction (mod/control.lua's
@@ -246,7 +246,7 @@ class TestGameState:
 class TestGameStateSaveResolution:
     """Since mod 0.3.1, data files live under base_dir/<save_id>/, discovered
     via a current-save.json pointer -- see game_state.py's module docstring
-    and SCHEMA.md. These cover the bridge-side resolution logic."""
+    and SCHEMA.md. These cover the consumer-side resolution logic."""
 
     def test_no_pointer_falls_back_to_base_dir(self, tmp_path: Path) -> None:
         write_json(tmp_path / "tech.json", {"tick": 1})
@@ -266,7 +266,7 @@ class TestGameStateSaveResolution:
 
     def test_rebinds_when_active_save_changes(self, tmp_path: Path) -> None:
         # Simulates switching which save/server is running without
-        # restarting the bridge.
+        # reconfiguring SCRIPT_OUTPUT_DIR.
         old_dir, new_dir = tmp_path / "old", tmp_path / "new"
         old_dir.mkdir()
         new_dir.mkdir()
@@ -301,12 +301,14 @@ class TestGameStateSaveResolution:
 
 class TestGameStateLocking:
     def test_refresh_is_serialized_by_a_lock(self, tmp_path: Path) -> None:
-        """GameState is queried from concurrent asyncio.to_thread() workers
-        (src/server.py), so refresh() must hold a lock across its whole body.
-        The worst race it guards against: two threads both pass the
-        min_refresh_interval throttle and both call BuildingIndex.refresh(),
-        which would double-advance its byte offset and permanently skip
-        whatever fell in the gap.
+        """GameState holds a lock across refresh()'s whole body -- a
+        holdover from when the former src/server.py MCP server queried it
+        from concurrent asyncio.to_thread() workers; today's one-shot CLI
+        callers are single-threaded, but the lock stays in place for any
+        future concurrent caller. The worst race it guards against: two
+        threads both pass the min_refresh_interval throttle and both call
+        BuildingIndex.refresh(), which would double-advance its byte offset
+        and permanently skip whatever fell in the gap.
 
         Verified directly (not probabilistically): patch
         BuildingIndex.refresh to record when each call starts/ends, run two

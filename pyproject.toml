@@ -5,14 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "factorio-live-mcp"
 version = "0.1.0"
-description = "Local MCP bridge serving live Factorio game state exported by the flma mod"
+description = "Live Factorio game state reading + CLI tooling (factory planner, live-observe commands) for the flma mod"
 requires-python = ">=3.11"
 authors = [
     {name = "jhjaggars"},
 ]
-dependencies = [
-    "mcp[cli]>=1.12",
-]
+dependencies = []
 
 [project.scripts]
 flma-planner = "planner.cli:main"

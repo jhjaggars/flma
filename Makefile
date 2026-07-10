@@ -1,7 +1,7 @@
 # Makefile for factorio-live-mcp
 # Uses 'uv run' to execute commands in the project environment
 
-.PHONY: help install dev test lint format typecheck clean run mod-zip
+.PHONY: help install dev test lint format typecheck clean mod-zip
 
 .DEFAULT_GOAL := help
 
@@ -45,9 +45,6 @@ ci: ## Full CI validation
 
 clean: ## Clean up generated files
 	uv run nox -s clean
-
-run: ## Run MCP server locally (for dev/testing)
-	uv run python -m src.server
 
 trace-ui: ## View agent-eval MLflow traces (tests/agent_eval/mlruns) in the real MLflow UI, via uvx (no project deps added)
 	MLFLOW_ALLOW_FILE_STORE=true uvx --from mlflow mlflow ui --backend-store-uri file:./tests/agent_eval/mlruns --port 5001

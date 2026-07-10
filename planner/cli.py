@@ -17,7 +17,19 @@ Usage:
     uv run python -m planner.cli belts 2                 # belts -> achievable rate
     uv run python -m planner.cli tech "Copper processing - Stage 1"  # what it unlocks & whether it combines
 
-See .claude/skills/factory-planner/SKILL.md for the workflows this backs, and
+Live-observe commands (read the running game's state directly, no chain math):
+    uv run python -m planner.cli research                # current research/queue
+    uv run python -m planner.cli tech-tree --status available
+    uv run python -m planner.cli production --kind items  # per-minute rates
+    uv run python -m planner.cli logistics                # network contents, bot counts
+    uv run python -m planner.cli inventory                # a connected player's inventory
+    uv run python -m planner.cli buildings                # placed-building counts
+    uv run python -m planner.cli buildings --type assembling-machine --list
+
+Any command accepts --json for machine-readable output.
+
+See .claude/skills/factory-planner/SKILL.md and
+.claude/skills/factorio-live/SKILL.md for the workflows these back, and
 CLAUDE.md's factory-planner section for the modpack-alignment caveat.
 """
 
@@ -25,12 +37,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import math
 import sys
 from collections import Counter
 from types import ModuleType
 
-from planner import config, live_state, module_bonus, techbundle, throughput
+from planner import config, live_state, module_bonus, observe, techbundle, throughput
 from planner._recipe_mcp_loader import load_async_database_class, load_engine
 from planner.options import classify_producer, deeper_choices, tree_categories, tree_stages
 from planner.recommend import rank_candidates
@@ -468,6 +481,22 @@ async def cmd_status(args: argparse.Namespace) -> int:
     tech = gs.get_tech()
     force_data = tech.get("forces", {}).get(args.force, {})
 
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "recipes_db": str(config.RECIPES_DB),
+                    "script_output_dir": str(config.SCRIPT_OUTPUT_DIR),
+                    "age_seconds": ages,
+                    "alignment": align,
+                    "force": args.force,
+                    "current_research": force_data.get("current_research"),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
     print(f"recipes.db     : {config.RECIPES_DB}  ({align['db_tech_count']} technologies)")
     print(f"flma live data : {config.SCRIPT_OUTPUT_DIR}")
     for name, age in ages.items():
@@ -502,6 +531,150 @@ async def cmd_status(args: argparse.Namespace) -> int:
         "\nnext: `recommend <product>` for the single best way to make something right now; "
         "`plan <product> --rate <n>` to design a line; `have <item>` to check current production."
     )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# live-observe commands — read the running game's state directly, no chain
+# math (planner/observe.py holds the pure shaping logic; these just render it)
+# ---------------------------------------------------------------------------
+
+
+def _print_observe_error(result: dict) -> int:
+    if "hint" in result:
+        return _fail(f"{result['error']} — {result['hint']}")
+    if "available_forces" in result:
+        return _fail(
+            f"{result['error']} (available: {', '.join(result['available_forces']) or 'none'})"
+        )
+    return _fail(result["error"])
+
+
+async def cmd_research(args: argparse.Namespace) -> int:
+    gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
+    result = observe.research_status(gs, force=args.force)
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    if "error" in result:
+        return _print_observe_error(result)
+    print(
+        f"force '{result['force']}' — current research: {result.get('current_research') or '(idle)'}"
+    )
+    if result.get("research_progress") is not None:
+        print(f"  progress: {result['research_progress'] * 100:.1f}%")
+    queue = result.get("research_queue") or []
+    if queue:
+        print(f"  queue ({len(queue)}): {', '.join(queue)}")
+    return 0
+
+
+async def cmd_tech_tree(args: argparse.Namespace) -> int:
+    gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
+    result = observe.tech_tree(gs, force=args.force, status=args.status)
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    if "error" in result:
+        return _print_observe_error(result)
+    print(f"force '{result['force']}' — {result['count']} technologies ({result['status_filter']})")
+    for t in result["technologies"]:
+        print(f"  {t['name']:<40} {t['status']:<11} level={t['level']}")
+    return 0
+
+
+async def cmd_production(args: argparse.Namespace) -> int:
+    gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
+    result = observe.production_stats(gs, force=args.force, surface=args.surface, kind=args.kind)
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    if "error" in result:
+        return _print_observe_error(result)
+    print(f"force '{result['force']}', surface '{result['surface']}'")
+    for kind_key in ("items", "fluids"):
+        block = result.get(kind_key)
+        if block is None:
+            continue
+        in_rates: dict = block.get("input_rates_per_min") or {}
+        out_rates: dict = block.get("output_rates_per_min") or {}
+        names = sorted(set(in_rates) | set(out_rates))
+        if not names:
+            continue
+        print(f"\n{kind_key} (produced +/consumed -, per minute):")
+        for name in names:
+            in_rate = in_rates.get(name, 0.0)
+            out_rate = out_rates.get(name, 0.0)
+            print(f"  {name:<40} +{in_rate:>10.1f}  -{out_rate:>10.1f}")
+    return 0
+
+
+async def cmd_logistics(args: argparse.Namespace) -> int:
+    gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
+    result = observe.logistics(gs, force=args.force, surface=args.surface)
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    if "error" in result:
+        return _print_observe_error(result)
+    print(f"force '{result['force']}' — {result['network_count']} logistic network(s)")
+    for n in result["networks"]:
+        print(
+            f"  network {n.get('network_id')} surface={n.get('surface')} "
+            f"logistic-bots={n.get('available_logistic_robots')}/{n.get('all_logistic_robots')} "
+            f"construction-bots={n.get('available_construction_robots')}/{n.get('all_construction_robots')} "
+            f"stored-item-types={len(n.get('contents') or [])}"
+        )
+    return 0
+
+
+async def cmd_inventory(args: argparse.Namespace) -> int:
+    gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
+    result = observe.player_inventory(gs, player=args.player)
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    if "error" in result:
+        return _print_observe_error(result)
+    print(f"player '{result['player']}' inventory:")
+    for entry in sorted(result.get("contents") or [], key=lambda e: e["name"]):
+        print(f"  {entry['name']:<40} {entry['count']} ({entry.get('quality', 'normal')})")
+    return 0
+
+
+async def cmd_buildings(args: argparse.Namespace) -> int:
+    gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
+    listing = bool(args.name or args.type or args.surface or args.list)
+    if listing:
+        result = observe.query_buildings(
+            gs,
+            name=args.name,
+            type=args.type,
+            surface=args.surface,
+            force=args.force,
+            limit=args.limit,
+        )
+        if args.json:
+            print(json.dumps(result, indent=2))
+            return 0
+        print(f"{result['total_matches']} match(es){' (truncated)' if result['truncated'] else ''}")
+        for b in result["results"]:
+            print(f"  {b.get('name'):<35} surface={b.get('surface'):<10} pos={b.get('position')}")
+        return 0
+
+    result = observe.building_counts(gs, force=args.force)
+    if args.json:
+        print(json.dumps(result, indent=2))
+        return 0
+    if result.get("total", 0) == 0:
+        print(result.get("hint") or "no buildings found")
+        if "available_forces" in result:
+            print(f"available forces: {', '.join(result['available_forces'])}")
+        return 0
+    print(f"total: {result['total']}")
+    print("\nby name:")
+    for name, count in result["by_name"].items():
+        print(f"  {name:<40} {count}")
     return 0
 
 
@@ -2149,6 +2322,55 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument(
         "--force", default="player", help="Factorio force to scope to (default: player)"
     )
+    p_status.add_argument("--json", action="store_true", help="machine-readable output")
+
+    p_research = sub.add_parser("research", help="current research target, progress, and queue")
+    p_research.add_argument("--force", default="player")
+    p_research.add_argument("--json", action="store_true")
+
+    p_tech_tree = sub.add_parser("tech-tree", help="technologies: researched / available / locked")
+    p_tech_tree.add_argument("--force", default="player")
+    p_tech_tree.add_argument(
+        "--status",
+        choices=["all", "researched", "available", "locked"],
+        default="all",
+    )
+    p_tech_tree.add_argument("--json", action="store_true")
+
+    p_production = sub.add_parser(
+        "production", help="item/fluid production totals and per-minute rates"
+    )
+    p_production.add_argument("--force", default="player")
+    p_production.add_argument("--surface", default=None, help="default: nauvis, else first surface")
+    p_production.add_argument("--kind", choices=["items", "fluids", "both"], default="both")
+    p_production.add_argument("--json", action="store_true")
+
+    p_logistics = sub.add_parser("logistics", help="logistic network contents and robot counts")
+    p_logistics.add_argument("--force", default="player")
+    p_logistics.add_argument("--surface", default=None, help="filter to one surface/planet")
+    p_logistics.add_argument("--json", action="store_true")
+
+    p_inventory = sub.add_parser(
+        "inventory", help="a connected player's inventory (needs flma-export-inventories)"
+    )
+    p_inventory.add_argument(
+        "--player", default=None, help="default: the single connected player, if only one"
+    )
+    p_inventory.add_argument("--json", action="store_true")
+
+    p_buildings = sub.add_parser(
+        "buildings",
+        help="placed-building counts, or filtered listing with positions (needs flma-export-buildings)",
+    )
+    p_buildings.add_argument("--name", default=None, help="exact entity prototype name")
+    p_buildings.add_argument("--type", default=None, help="exact entity type")
+    p_buildings.add_argument("--surface", default=None)
+    p_buildings.add_argument("--force", default=None)
+    p_buildings.add_argument(
+        "--list", action="store_true", help="list matching buildings with positions"
+    )
+    p_buildings.add_argument("--limit", type=int, default=100, help="max results (1-200)")
+    p_buildings.add_argument("--json", action="store_true")
 
     p_options = sub.add_parser(
         "options",
@@ -2544,6 +2766,12 @@ _HANDLERS = {
     "belts": cmd_belts,
     "tech": cmd_tech,
     "recommend": cmd_recommend,
+    "research": cmd_research,
+    "tech-tree": cmd_tech_tree,
+    "production": cmd_production,
+    "logistics": cmd_logistics,
+    "inventory": cmd_inventory,
+    "buildings": cmd_buildings,
 }
 
 
@@ -2553,6 +2781,7 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command or "status"
     if command == "status" and not hasattr(args, "force"):
         args.force = "player"
+        args.json = False
     handler = _HANDLERS[command]
     return asyncio.run(handler(args))
 

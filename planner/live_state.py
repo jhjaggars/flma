@@ -4,10 +4,9 @@ detection — all derived from flma's `GameState` (src/game_state.py), read
 directly off disk. No MCP server or Hermes involved.
 
 None of this net-production math exists elsewhere in the codebase —
-src/server.py's `get_production_stats` only passes the raw per-surface
-`input_counts`/`output_counts` straight through (see the flma exploration
-notes in the factory-planner plan); this module is what actually subtracts
-them.
+`planner/observe.py`'s `production_stats` (the `production` CLI command) only
+passes the raw per-surface `input_counts`/`output_counts` straight through;
+this module is what actually subtracts them.
 """
 
 from __future__ import annotations
@@ -99,12 +98,12 @@ def buffered_stock(gs: GameState, force: str = "player") -> dict[str, int]:
 
 def building_counts(gs: GameState, force: str = "player") -> dict[str, int]:
     """Placed-building counts by internal entity name, for `force`, from
-    `buildings.ndjson` (see `../SCHEMA.md`). Mirrors `src/server.py`'s
-    `get_building_counts` `by_name` grouping — kept independent rather than
-    imported, since this module derives everything straight from `GameState`
-    with no MCP server involved (same rationale as `net_production`/
-    `buffered_stock` re-deriving their own math instead of calling
-    `src/server.py`'s tool functions)."""
+    `buildings.ndjson` (see `../SCHEMA.md`) — a bare `name -> count` map for
+    `plan`'s "existing buildings" reuse cross-reference. Deliberately
+    narrower than `planner/observe.py`'s `building_counts` (the `buildings`
+    CLI command's richer `total`/`by_name`/`by_type`/hint shape, meant for
+    direct display) rather than sharing it, since the two callers want
+    different return shapes for different purposes."""
     counts: dict[str, int] = {}
     for b in gs.get_buildings():
         if b.get("force") != force:

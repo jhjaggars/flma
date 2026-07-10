@@ -12,7 +12,7 @@ Every peer writes its own local copy; there is no `for_player` filtering.
 ## Efficiency — the core design constraint
 
 Because this code runs on the server for every player, not just the one running
-the bridge, per-tick cost is shared by everyone. `control.lua` follows these
+the CLI, per-tick cost is shared by everyone. `control.lua` follows these
 rules throughout (see its top-of-file comment for the full rationale):
 
 1. No `on_tick` hook — only `script.on_nth_tick(N)` with a large, configurable `N`
@@ -117,8 +117,8 @@ From the repo root: `make mod-zip` → `flma_<version>.zip`; drop into
 ## Verifying in-game
 
 Confirmed working against a real running client (mod checksum loads clean, settings
-toggle live via `on_runtime_mod_setting_changed`, all 8 MCP tools return real data
-from a live save):
+toggle live via `on_runtime_mod_setting_changed`, all live-observe CLI commands return
+real data from a live save):
 
 1. Copy `mod/` into `~/.factorio/mods/flma_<version>/` (or `make mod-zip` and use the
    in-game mod manager), enable it, start/load a save.
@@ -128,10 +128,11 @@ from a live save):
    non-empty `forces.player` entry.
 3. Research a technology; confirm `tech.json` updates without waiting a full
    `flma-tick-interval`.
-4. Run the bridge (`make run` with `SCRIPT_OUTPUT_DIR` pointed at
-   `script-output/flma`, the parent directory — it resolves `current-save.json`
-   itself) and exercise each tool via the MCP inspector or a client; confirm
-   `get_snapshot_age` tracks the live game.
+4. With `SCRIPT_OUTPUT_DIR` pointed at `script-output/flma` (the parent
+   directory — it resolves `current-save.json` itself), exercise each command
+   (`uv run python -m planner research`, `production`, `logistics`,
+   `inventory`, `buildings`); confirm `status --json`'s `age_seconds` tracks
+   the live game.
 5. Enable `flma-export-buildings`; confirm `buildings.ndjson` gets a burst of `add`
    events (the baseline scan) spread across a few ticks, not one frame spike.
    ✅ Verified 2026-07: a 26,195-building base wrote its baseline across ~59 ticks.

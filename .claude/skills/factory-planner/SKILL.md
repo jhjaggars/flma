@@ -314,8 +314,9 @@ Two env vars (both optional, sensible defaults):
   `recipes.json` to already be present there).
 
 `SCRIPT_OUTPUT_DIR` (flma's own existing env var) controls where live
-snapshots are read from, same as the MCP bridge.
+snapshots are read from — shared with the `factorio-live` skill's
+research/production/logistics/inventory/buildings commands.
 
 Debugging internals (import-aliasing trick, where the netting math lives,
-how the CLI and MCP server share engine code) live in `planner/CLAUDE.md`,
-not here — not needed for normal use of this skill.
+how recipe-mcp's engine is reused) live in `planner/CLAUDE.md`, not here —
+not needed for normal use of this skill.

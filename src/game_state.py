@@ -13,15 +13,19 @@ base size. This module owns:
     shrinking below the last-read offset, or (since a same-or-larger rewrite
     would otherwise be missed) its leading-bytes fingerprint changing — and
     replays from scratch in that case.
-  - GameState: composes the above and is what src/server.py's tools query.
-    Guards all reads/writes of its own state with one coarse lock, since
-    src/server.py calls it from concurrent request handlers. Also resolves
-    which per-save subdirectory is currently active (see below) before every
-    refresh, so it follows the mod across save/server switches without the
-    operator having to reconfigure SCRIPT_OUTPUT_DIR.
+  - GameState: composes the above and is what planner/observe.py and
+    planner/live_state.py query. Guards all reads/writes of its own state
+    with one coarse lock — a holdover from when the former src/server.py MCP
+    server called it from concurrent request handlers; a one-shot CLI process
+    doesn't need it but it's harmless to keep. Also resolves which per-save
+    subdirectory is currently active (see below) before every refresh, so it
+    follows the mod across save/server switches without the operator having
+    to reconfigure SCRIPT_OUTPUT_DIR.
 
-All file I/O here is synchronous; src/server.py wraps calls in
-asyncio.to_thread(), mirroring the AsyncDatabase pattern in apps/recipe-mcp.
+All file I/O here is synchronous — callers needing async (e.g. an MCP server,
+were one added back) would wrap calls in asyncio.to_thread(), mirroring the
+AsyncDatabase pattern in apps/recipe-mcp; planner's CLI callers just call it
+directly.
 
 ## Per-save directories
 
@@ -227,19 +231,23 @@ class BuildingIndex:
 
 class GameState:
     """Composes the tech/production/logistics/inventory snapshots and the
-    building index into the query surface used by MCP tools.
+    building index into the query surface used by planner/observe.py and
+    planner/live_state.py.
 
-    Not thread-safe on its own, but src/server.py calls it from concurrent
-    request handlers via asyncio.to_thread — so every method here that reads
-    or mutates instance state (refresh(), and the getters, since they call
-    refresh() and then read the just-refreshed state) takes `self._lock`.
-    Worst race this guards against: two threads both pass the
-    min_refresh_interval throttle in refresh() and both call
-    BuildingIndex.refresh(), which would double-advance its byte offset and
+    Not thread-safe on its own — the lock exists because the former
+    src/server.py MCP server called it from concurrent request handlers via
+    asyncio.to_thread, so every method here that reads or mutates instance
+    state (refresh(), and the getters, since they call refresh() and then
+    read the just-refreshed state) takes `self._lock`. A one-shot CLI process
+    only ever calls it from one thread, so the lock is now inert overhead,
+    kept in case a future concurrent caller needs it again. Worst race this
+    guards against: two threads both pass the min_refresh_interval throttle
+    in refresh() and both call BuildingIndex.refresh(), which would
+    double-advance its byte offset and
     permanently skip whatever fell in the gap. One coarse `RLock` (reentrant,
     so refresh() can be called from within an already-locked getter without
-    deadlocking) is simple and plenty at this scale — this is polled by a
-    handful of MCP tool calls, not a hot path.
+    deadlocking) is simple and plenty at this scale — this is called a
+    handful of times per CLI invocation, not a hot path.
     """
 
     def __init__(self, script_output_dir: Path, min_refresh_interval: float = 0.5) -> None:
@@ -298,7 +306,7 @@ class GameState:
             self._resolve_active_dir()
             return self.dir.exists()
 
-    # -- query helpers used by server.py tools --------------------------------
+    # -- query helpers used by planner/observe.py and planner/live_state.py ---
 
     def get_tech(self) -> dict[str, Any]:
         with self._lock:

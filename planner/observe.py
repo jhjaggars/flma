@@ -1,89 +1,47 @@
-"""Factorio live game-data MCP server (local bridge for the flma mod).
+"""Live-observe helpers backing the `research`/`tech-tree`/`production`/
+`logistics`/`inventory`/`buildings` planner subcommands.
 
-Reads script-output/flma/* written by the flma Factorio mod (see
-apps/factorio-live-mcp/mod/) and serves it over Streamable HTTP as MCP tools.
-Runs locally on the machine running the Factorio client — see
-apps/factorio-live-mcp/CLAUDE.md for why (the mod writes to the *local*
-script-output of whichever peer runs it; a pure client can't pull from a
-remote server without RCON).
-
-Tools:
-  get_research_status   -- current research, progress, queue
-  get_tech_tree          -- researched / available / locked technologies
-  get_production_stats   -- item/fluid cumulative totals & per-minute rates
-  get_logistics           -- logistic network contents and robot counts
-  get_player_inventory    -- a connected player's main inventory
-  get_building_counts     -- placed-building counts by name/type
-  query_buildings         -- filter placed buildings by name/type/surface/force
-  get_snapshot_age        -- staleness (seconds) of each feed, for sanity checking
+Pure functions over a `GameState` (src/game_state.py), each shaping one
+snapshot file into the dict `planner/cli.py` prints (as `--json` or rendered
+text). Ported from the former `src/server.py` MCP tools — same shaping logic
+(force/surface fallback, tech classification, no-data hints), just without
+the MCP/asyncio wrapping: a CLI invocation is a one-shot sync read.
 """
 
 from __future__ import annotations
 
-import asyncio
-import logging
+from typing import Any
 
-from mcp.server.fastmcp import FastMCP
-from starlette.requests import Request
-from starlette.responses import PlainTextResponse
+from src.game_state import GameState
 
-from .config import HOST, LOG_LEVEL, MIN_REFRESH_INTERVAL_SECONDS, PORT, SCRIPT_OUTPUT_DIR
-from .game_state import GameState
-
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
-logger = logging.getLogger(__name__)
-
-mcp = FastMCP(
-    name="factorio-live",
-    host=HOST,
-    port=PORT,
-    streamable_http_path="/mcp",
-)
-
-state = GameState(SCRIPT_OUTPUT_DIR, min_refresh_interval=MIN_REFRESH_INTERVAL_SECONDS)
-
-MAX_RESULTS = 200
+MAX_BUILDING_RESULTS = 200
 
 
-@mcp.custom_route("/healthz", methods=["GET"])
-async def healthz(request: Request) -> PlainTextResponse:
-    ok = await asyncio.to_thread(state.health_check)
-    if ok:
-        return PlainTextResponse("ok")
-    return PlainTextResponse(f"script-output dir not found: {state.dir}", status_code=503)
-
-
-def _no_data_hint() -> dict:
+def _no_data_hint(gs: GameState) -> dict[str, Any]:
     return {
         "error": "no data yet",
         "hint": (
             "Enable the flma mod in-game: set the map setting "
             "'flma-export-enabled' to true (Mod settings -> Map), or run "
             "/c settings.global['flma-export-enabled'] = {value=true}. "
-            f"Expecting files under {state.dir}."
+            f"Expecting files under {gs.dir}."
         ),
     }
 
 
-@mcp.tool()
-async def get_research_status(force: str = "player") -> dict:
-    """Get the current research target, progress, and queue for a force.
+def research_status(gs: GameState, force: str = "player") -> dict[str, Any]:
+    """Current research target, progress, and queue for `force`.
 
     Prefers research.json (refreshed every flma-tick-interval cycle, so
     research_progress stays live) over tech.json's copy of the same fields
     (only refreshed on research started/finished/queued/cancelled/reversed
-    events, plus whichever fields research.json's snapshot doesn't carry —
-    currently none, since tech.json's version is a superset for these three
-    fields). Falls back to tech.json if research.json is empty (e.g. an
+    events). Falls back to tech.json if research.json is empty (e.g. an
     older mod build that predates it).
-
-    Args:
-        force: Force name (default 'player', the usual single-player/co-op force).
     """
-    research_data = await asyncio.to_thread(state.get_research)
-    tech_data = await asyncio.to_thread(state.get_tech)
+    research_data = gs.get_research()
+    tech_data = gs.get_tech()
     if not research_data and not tech_data:
-        return _no_data_hint()
+        return _no_data_hint(gs)
 
     research_forces: dict = research_data.get("forces") or {}
     tech_forces: dict = tech_data.get("forces") or {}
@@ -112,18 +70,12 @@ async def get_research_status(force: str = "player") -> dict:
     }
 
 
-@mcp.tool()
-async def get_tech_tree(force: str = "player", status: str = "all") -> dict:
-    """Get the technology tree: which technologies are researched, available
-    to research now (prerequisites met), or still locked.
-
-    Args:
-        force: Force name (default 'player').
-        status: One of 'all', 'researched', 'available', 'locked' (default 'all').
-    """
-    data = await asyncio.to_thread(state.get_tech)
+def tech_tree(gs: GameState, force: str = "player", status: str = "all") -> dict[str, Any]:
+    """Technologies for `force`: researched, available (prerequisites met),
+    or still locked. `status` filters to one of those, or 'all'."""
+    data = gs.get_tech()
     if not data:
-        return _no_data_hint()
+        return _no_data_hint(gs)
     forces: dict = data.get("forces") or {}
     force_data = forces.get(force)
     if force_data is None:
@@ -163,37 +115,24 @@ async def get_tech_tree(force: str = "player", status: str = "all") -> dict:
     }
 
 
-@mcp.tool()
-async def get_production_stats(
+def production_stats(
+    gs: GameState,
     force: str = "player",
     surface: str | None = None,
     kind: str = "both",
-) -> dict:
-    """Get production statistics for items and/or fluids on a surface.
+) -> dict[str, Any]:
+    """Item/fluid production for `force` on `surface`.
 
-    Each returned `items`/`fluids` block has two different kinds of numbers —
-    don't confuse them:
-      - `input_counts`/`output_counts`: CUMULATIVE totals since the game (or
-        force) began, not rates. `input_counts` is what the force has ever
-        *produced*; `output_counts` is what it has ever *consumed* (matches
-        the left/right split in the in-game production statistics GUI).
-      - `input_rates_per_min`/`output_rates_per_min`: real per-minute flow
-        rates (roughly the last 60s), suitable for "how much am I making
-        right now" — use these, not the cumulative counts, for anything
-        rate-shaped.
-
-    Values are aggregated by the game engine (not scanned), so this is cheap
-    to call frequently.
-
-    Args:
-        force: Force name (default 'player').
-        surface: Surface name (default: 'nauvis' if present, else the first
-            surface in the snapshot).
-        kind: One of 'items', 'fluids', 'both' (default 'both').
+    Each `items`/`fluids` block has two different kinds of numbers:
+    `input_counts`/`output_counts` are CUMULATIVE totals since the game (or
+    force) began (produced/consumed, matching the in-game GUI's left/right
+    split); `input_rates_per_min`/`output_rates_per_min` are real per-minute
+    flow rates — use those, not the cumulative counts, for "how much am I
+    making right now".
     """
-    data = await asyncio.to_thread(state.get_production)
+    data = gs.get_production()
     if not data:
-        return _no_data_hint()
+        return _no_data_hint(gs)
     forces: dict = data.get("forces") or {}
     force_data = forces.get(force)
     if force_data is None:
@@ -208,7 +147,7 @@ async def get_production_stats(
         }
 
     surface_data = surfaces[surface_name]
-    out: dict = {"tick": data.get("tick"), "force": force, "surface": surface_name}
+    out: dict[str, Any] = {"tick": data.get("tick"), "force": force, "surface": surface_name}
     if kind in ("items", "both"):
         out["items"] = surface_data.get("items")
     if kind in ("fluids", "both"):
@@ -216,17 +155,12 @@ async def get_production_stats(
     return out
 
 
-@mcp.tool()
-async def get_logistics(force: str = "player", surface: str | None = None) -> dict:
-    """Get logistic network contents and robot counts.
-
-    Args:
-        force: Force name (default 'player').
-        surface: Optional surface name to filter to a single surface/planet.
-    """
-    data = await asyncio.to_thread(state.get_logistics)
+def logistics(gs: GameState, force: str = "player", surface: str | None = None) -> dict[str, Any]:
+    """Logistic network contents and robot counts for `force`, optionally
+    filtered to one surface/planet."""
+    data = gs.get_logistics()
     if not data:
-        return _no_data_hint()
+        return _no_data_hint(gs)
     forces: dict = data.get("forces") or {}
     networks = forces.get(force)
     if networks is None:
@@ -243,21 +177,17 @@ async def get_logistics(force: str = "player", surface: str | None = None) -> di
     }
 
 
-@mcp.tool()
-async def get_player_inventory(player: str | None = None) -> dict:
-    """Get a connected player's main inventory contents.
+def player_inventory(gs: GameState, player: str | None = None) -> dict[str, Any]:
+    """A connected player's main inventory contents.
 
-    Requires the flma-export-inventories map setting to be enabled (off by
-    default — player inventory contents are more sensitive than aggregate
-    stats).
-
-    Args:
-        player: Player name. If omitted and exactly one player is connected,
-            that player's inventory is returned.
+    Requires the flma-export-inventories map setting (off by default —
+    player inventory contents are more sensitive than aggregate stats).
+    If `player` is omitted and exactly one player is connected, that
+    player's inventory is returned.
     """
-    data = await asyncio.to_thread(state.get_inventories)
+    data = gs.get_inventories()
     if not data:
-        return _no_data_hint()
+        return _no_data_hint(gs)
     players: dict = data.get("players") or {}
     if not players:
         return {
@@ -274,16 +204,10 @@ async def get_player_inventory(player: str | None = None) -> dict:
     return {"tick": data.get("tick"), "player": player, **players[player]}
 
 
-@mcp.tool()
-async def get_building_counts(force: str | None = None) -> dict:
-    """Get placed-building counts grouped by name and by type.
-
-    Requires the flma-export-buildings map setting to be enabled.
-
-    Args:
-        force: Optional force name to filter to (e.g. 'player').
-    """
-    all_buildings = await asyncio.to_thread(state.get_buildings)
+def building_counts(gs: GameState, force: str | None = None) -> dict[str, Any]:
+    """Placed-building counts grouped by name and by type, optionally
+    filtered to one force. Requires the flma-export-buildings map setting."""
+    all_buildings = gs.get_buildings()
     if not all_buildings:
         return {
             "total": 0,
@@ -313,27 +237,18 @@ async def get_building_counts(force: str | None = None) -> dict:
     }
 
 
-@mcp.tool()
-async def query_buildings(
+def query_buildings(
+    gs: GameState,
     name: str | None = None,
     type: str | None = None,
     surface: str | None = None,
     force: str | None = None,
     limit: int = 100,
-) -> dict:
-    """Query placed buildings by name/type/surface/force, with positions.
-
-    Requires the flma-export-buildings map setting to be enabled.
-
-    Args:
-        name: Exact entity prototype name (e.g. 'assembling-machine-2').
-        type: Exact entity type (e.g. 'assembling-machine', 'inserter').
-        surface: Surface name (e.g. 'nauvis').
-        force: Force name (e.g. 'player').
-        limit: Max results to return (1-200, default 100).
-    """
-    limit = max(1, min(limit, MAX_RESULTS))
-    buildings = await asyncio.to_thread(state.get_buildings)
+) -> dict[str, Any]:
+    """Placed buildings filtered by exact name/type/surface/force, with
+    positions. Requires the flma-export-buildings map setting."""
+    limit = max(1, min(limit, MAX_BUILDING_RESULTS))
+    buildings = gs.get_buildings()
     if not buildings:
         return {
             "results": [],
@@ -355,17 +270,3 @@ async def query_buildings(
         "total_matches": len(results),
         "truncated": len(results) > limit,
     }
-
-
-@mcp.tool()
-async def get_snapshot_age() -> dict:
-    """Get how many seconds old each data feed is — use this to sanity-check
-    that the mod is actually running and exporting (e.g. before trusting a
-    'no research in progress' answer, confirm the tech feed is fresh)."""
-    ages = await asyncio.to_thread(state.snapshot_ages)
-    return {"script_output_dir": str(state.dir), "age_seconds": ages}
-
-
-if __name__ == "__main__":
-    logger.info("Starting factorio-live MCP server on port %d (reading %s)…", PORT, state.dir)
-    mcp.run(transport="streamable-http")

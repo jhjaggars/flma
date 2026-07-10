@@ -1,10 +1,11 @@
 # flma data schema
 
 This document is the contract between the two halves of this project: the
-**producer** (the `flma` Factorio mod, `mod/`) and any **consumer** (the MCP
-bridge in `src/`, the planner CLI in `planner/`, `dev/summary.py`, or anything
-you write yourself). The mod writes the files described here; consumers read
-them and nothing else — there is no other channel between the two.
+**producer** (the `flma` Factorio mod, `mod/`) and any **consumer** (the
+live-state reading layer in `src/`, the planner CLI in `planner/`,
+`dev/summary.py`, or anything you write yourself). The mod writes the files
+described here; consumers read them and nothing else — there is no other
+channel between the two.
 
 Describes the format as written by mod version **0.3.1** (`mod/info.json`).
 Shape changes are noted in `mod/changelog.txt`; additions of new fields or new
@@ -114,7 +115,7 @@ stale between events; use `research.json` for the live value.
   `enabled=false` means locked out (e.g. hidden by a mod). A technology is
   *available to research* when it's not researched, is enabled, and all its
   `prerequisites` are researched — the file doesn't precompute that;
-  consumers derive it (see `get_tech_tree` in `src/server.py`).
+  consumers derive it (see `tech_tree` in `planner/observe.py`).
 - `level` — current level, only meaningful for repeatable/leveled techs.
 - `mining_drill_productivity_bonus` — the force's current mining-drill yield
   bonus (`LuaForce::mining_drill_productivity_bonus`; e.g. `0.2` = +20% ore

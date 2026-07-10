@@ -1,10 +1,8 @@
-"""Unit tests for the MCP tool functions in src.server.
+"""Unit tests for planner.observe's pure functions.
 
-FastMCP tools are plain async functions under the @mcp.tool() decorator, so
-they can be called directly (mirroring apps/recipe-mcp's test_tools.py
-pattern). We swap the module-level `state` for a GameState pointed at a
-tmp_path with hand-written fixture files, so no real Factorio process is
-needed.
+Ported from the former src/server.py MCP tool tests (test_tools.py) — same
+GameState-pointed-at-tmp_path fixture pattern, but calling the plain sync
+observe.* functions directly instead of async FastMCP tools.
 """
 
 from __future__ import annotations
@@ -13,30 +11,26 @@ import json
 from pathlib import Path
 
 import pytest
-from src import server
+from planner import observe
 from src.game_state import GameState
 
 pytestmark = pytest.mark.unit
 
 
-def _use_state(tmp_path: Path) -> GameState:
-    gs = GameState(tmp_path, min_refresh_interval=0)
-    server.state = gs
-    return gs
+def _gs(tmp_path: Path) -> GameState:
+    return GameState(tmp_path, min_refresh_interval=0)
 
 
 def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-class TestGetResearchStatus:
-    async def test_no_data_yet(self, tmp_path: Path) -> None:
-        _use_state(tmp_path)
-        result = await server.get_research_status()
+class TestResearchStatus:
+    def test_no_data_yet(self, tmp_path: Path) -> None:
+        result = observe.research_status(_gs(tmp_path))
         assert "error" in result
 
-    async def test_returns_current_research(self, tmp_path: Path) -> None:
-        _use_state(tmp_path)
+    def test_returns_current_research(self, tmp_path: Path) -> None:
         write_json(
             tmp_path / "tech.json",
             {
@@ -51,17 +45,12 @@ class TestGetResearchStatus:
                 },
             },
         )
-        result = await server.get_research_status()
+        result = observe.research_status(_gs(tmp_path))
         assert result["current_research"] == "automation-2"
         assert result["research_progress"] == 0.5
         assert result["research_queue"] == ["automation-2", "logistics-2"]
 
-    async def test_prefers_research_json_over_stale_tech_json(self, tmp_path: Path) -> None:
-        # research.json is refreshed every tick-interval cycle so
-        # research_progress stays live; tech.json only updates on research
-        # events, so it can be stale mid-research. When both exist, the live
-        # one wins.
-        _use_state(tmp_path)
+    def test_prefers_research_json_over_stale_tech_json(self, tmp_path: Path) -> None:
         write_json(
             tmp_path / "tech.json",
             {
@@ -89,14 +78,11 @@ class TestGetResearchStatus:
                 },
             },
         )
-        result = await server.get_research_status()
+        result = observe.research_status(_gs(tmp_path))
         assert result["research_progress"] == 0.9
         assert result["tick"] == 50
 
-    async def test_falls_back_to_tech_json_when_research_json_absent(
-        self, tmp_path: Path
-    ) -> None:
-        _use_state(tmp_path)
+    def test_falls_back_to_tech_json_when_research_json_absent(self, tmp_path: Path) -> None:
         write_json(
             tmp_path / "tech.json",
             {
@@ -111,14 +97,13 @@ class TestGetResearchStatus:
                 },
             },
         )
-        result = await server.get_research_status()
+        result = observe.research_status(_gs(tmp_path))
         assert result["current_research"] == "automation-2"
         assert result["research_progress"] == 0.5
 
 
-class TestGetTechTree:
-    async def test_classifies_researched_available_locked(self, tmp_path: Path) -> None:
-        _use_state(tmp_path)
+class TestTechTree:
+    def test_classifies_researched_available_locked(self, tmp_path: Path) -> None:
         write_json(
             tmp_path / "tech.json",
             {
@@ -151,15 +136,14 @@ class TestGetTechTree:
                 },
             },
         )
-        result = await server.get_tech_tree()
+        result = observe.tech_tree(_gs(tmp_path))
         by_name = {t["name"]: t["status"] for t in result["technologies"]}
         assert by_name["automation"] == "researched"
         assert by_name["automation-2"] == "available"  # prereq (automation) researched
         assert by_name["automation-3"] == "locked"  # prereq (automation-2) not researched
         assert by_name["cheating"] == "locked"  # not enabled at all
 
-    async def test_status_filter(self, tmp_path: Path) -> None:
-        _use_state(tmp_path)
+    def test_status_filter(self, tmp_path: Path) -> None:
         write_json(
             tmp_path / "tech.json",
             {
@@ -174,14 +158,13 @@ class TestGetTechTree:
                 },
             },
         )
-        result = await server.get_tech_tree(status="researched")
+        result = observe.tech_tree(_gs(tmp_path), status="researched")
         assert result["count"] == 1
         assert result["technologies"][0]["name"] == "a"
 
 
-class TestGetProductionStats:
-    async def test_defaults_to_nauvis(self, tmp_path: Path) -> None:
-        _use_state(tmp_path)
+class TestProductionStats:
+    def test_defaults_to_nauvis(self, tmp_path: Path) -> None:
         write_json(
             tmp_path / "production.json",
             {
@@ -198,20 +181,18 @@ class TestGetProductionStats:
                 },
             },
         )
-        result = await server.get_production_stats()
+        result = observe.production_stats(_gs(tmp_path))
         assert result["surface"] == "nauvis"
         assert result["items"]["output_counts"]["iron-plate"] == 120
 
-    async def test_unknown_force(self, tmp_path: Path) -> None:
-        _use_state(tmp_path)
+    def test_unknown_force(self, tmp_path: Path) -> None:
         write_json(tmp_path / "production.json", {"tick": 1, "forces": {}})
-        result = await server.get_production_stats(force="enemy")
+        result = observe.production_stats(_gs(tmp_path), force="enemy")
         assert "error" in result
 
-    async def test_passes_through_rate_fields_alongside_cumulative_counts(
+    def test_passes_through_rate_fields_alongside_cumulative_counts(
         self, tmp_path: Path
     ) -> None:
-        _use_state(tmp_path)
         write_json(
             tmp_path / "production.json",
             {
@@ -233,25 +214,122 @@ class TestGetProductionStats:
                 },
             },
         )
-        result = await server.get_production_stats()
+        result = observe.production_stats(_gs(tmp_path))
         assert result["items"]["input_counts"]["iron-plate"] == 1200
         assert result["items"]["input_rates_per_min"]["iron-plate"] == 120.0
 
 
-class TestBuildingsTools:
-    async def test_get_building_counts_empty(self, tmp_path: Path) -> None:
-        _use_state(tmp_path)
-        result = await server.get_building_counts()
+class TestLogistics:
+    def test_no_data_yet(self, tmp_path: Path) -> None:
+        result = observe.logistics(_gs(tmp_path))
+        assert "error" in result
+
+    def test_returns_networks_for_force(self, tmp_path: Path) -> None:
+        write_json(
+            tmp_path / "logistics.json",
+            {
+                "tick": 1,
+                "forces": {
+                    "player": [
+                        {"network_id": 1, "surface": "nauvis", "contents": []},
+                        {"network_id": 2, "surface": "vulcanus", "contents": []},
+                    ]
+                },
+            },
+        )
+        result = observe.logistics(_gs(tmp_path))
+        assert result["network_count"] == 2
+
+    def test_filters_by_surface(self, tmp_path: Path) -> None:
+        write_json(
+            tmp_path / "logistics.json",
+            {
+                "tick": 1,
+                "forces": {
+                    "player": [
+                        {"network_id": 1, "surface": "nauvis", "contents": []},
+                        {"network_id": 2, "surface": "vulcanus", "contents": []},
+                    ]
+                },
+            },
+        )
+        result = observe.logistics(_gs(tmp_path), surface="vulcanus")
+        assert result["network_count"] == 1
+        assert result["networks"][0]["network_id"] == 2
+
+    def test_unknown_force(self, tmp_path: Path) -> None:
+        write_json(tmp_path / "logistics.json", {"tick": 1, "forces": {"player": []}})
+        result = observe.logistics(_gs(tmp_path), force="enemy")
+        assert "error" in result
+        assert result["available_forces"] == ["player"]
+
+
+class TestPlayerInventory:
+    def test_no_data_yet(self, tmp_path: Path) -> None:
+        result = observe.player_inventory(_gs(tmp_path))
+        assert "error" in result
+
+    def test_no_players_connected(self, tmp_path: Path) -> None:
+        write_json(tmp_path / "inventories.json", {"tick": 1, "players": {}})
+        result = observe.player_inventory(_gs(tmp_path))
+        assert "error" in result
+        assert "hint" in result
+
+    def test_single_connected_player_used_by_default(self, tmp_path: Path) -> None:
+        write_json(
+            tmp_path / "inventories.json",
+            {
+                "tick": 1,
+                "players": {
+                    "jhjaggars": {
+                        "contents": [{"name": "iron-plate", "quality": "normal", "count": 8}],
+                        "force": "player",
+                    }
+                },
+            },
+        )
+        result = observe.player_inventory(_gs(tmp_path))
+        assert result["player"] == "jhjaggars"
+        assert result["contents"][0]["name"] == "iron-plate"
+
+    def test_multiple_players_requires_explicit_name(self, tmp_path: Path) -> None:
+        write_json(
+            tmp_path / "inventories.json",
+            {
+                "tick": 1,
+                "players": {
+                    "alice": {"contents": [], "force": "player"},
+                    "bob": {"contents": [], "force": "player"},
+                },
+            },
+        )
+        result = observe.player_inventory(_gs(tmp_path))
+        assert "error" in result
+        assert sorted(result["connected_players"]) == ["alice", "bob"]
+
+        named = observe.player_inventory(_gs(tmp_path), player="bob")
+        assert named["player"] == "bob"
+
+    def test_unknown_player_name(self, tmp_path: Path) -> None:
+        write_json(
+            tmp_path / "inventories.json",
+            {"tick": 1, "players": {"alice": {"contents": [], "force": "player"}}},
+        )
+        result = observe.player_inventory(_gs(tmp_path), player="nobody")
+        assert "error" in result
+        assert result["connected_players"] == ["alice"]
+
+
+class TestBuildingsFunctions:
+    def test_building_counts_empty(self, tmp_path: Path) -> None:
+        result = observe.building_counts(_gs(tmp_path))
         assert result["total"] == 0
         assert "hint" in result  # no data at all -- still points at the setting
 
-    async def test_get_building_counts_force_filter_matches_nothing(
-        self, tmp_path: Path
-    ) -> None:
-        # Buildings exist, just not for the requested force -- this is a
-        # different situation from "the mod isn't exporting buildings at
-        # all", so the misleading "enable the setting" hint shouldn't appear.
-        gs = _use_state(tmp_path)
+    def test_building_counts_force_filter_matches_nothing(self, tmp_path: Path) -> None:
+        # Buildings exist, just not for the requested force -- distinct from
+        # "the mod isn't exporting buildings at all", so no misleading hint.
+        gs = _gs(tmp_path)
         events_path = tmp_path / "buildings.ndjson"
         with events_path.open("w", encoding="utf-8") as f:
             f.write(
@@ -273,13 +351,13 @@ class TestBuildingsTools:
             )
         gs.refresh(force=True)
 
-        result = await server.get_building_counts(force="enemy")
+        result = observe.building_counts(gs, force="enemy")
         assert result["total"] == 0
         assert "hint" not in result
         assert result["available_forces"] == ["player"]
 
-    async def test_query_and_count_buildings(self, tmp_path: Path) -> None:
-        gs = _use_state(tmp_path)
+    def test_query_and_count_buildings(self, tmp_path: Path) -> None:
+        gs = _gs(tmp_path)
         events_path = tmp_path / "buildings.ndjson"
         with events_path.open("w", encoding="utf-8") as f:
             for i, (name, typ) in enumerate(
@@ -308,35 +386,16 @@ class TestBuildingsTools:
                 )
         gs.refresh(force=True)
 
-        counts = await server.get_building_counts()
+        counts = observe.building_counts(gs)
         assert counts["total"] == 3
         assert counts["by_name"]["assembling-machine-2"] == 2
         assert counts["by_type"]["furnace"] == 1
 
-        query = await server.query_buildings(name="stone-furnace")
+        query = observe.query_buildings(gs, name="stone-furnace")
         assert query["total_matches"] == 1
         assert query["results"][0]["position"] == {"x": 2, "y": 0}
 
-
-class TestGetSnapshotAge:
-    async def test_reports_dir_and_ages(self, tmp_path: Path) -> None:
-        _use_state(tmp_path)
-        write_json(tmp_path / "tech.json", {"tick": 1})
-        result = await server.get_snapshot_age()
-        assert result["script_output_dir"] == str(tmp_path)
-        assert result["age_seconds"]["tech"] is not None
-        assert result["age_seconds"]["production"] is None
-        assert "research" in result["age_seconds"]
-        assert "buildings" in result["age_seconds"]
-
-    async def test_reports_buildings_and_research_ages(self, tmp_path: Path) -> None:
-        gs = _use_state(tmp_path)
-        write_json(tmp_path / "research.json", {"tick": 1, "forces": {}})
-        with (tmp_path / "buildings.ndjson").open("w", encoding="utf-8") as f:
-            f.write(
-                json.dumps({"t": 1, "op": "add", "entity": {"id": 1, "name": "a"}}) + "\n"
-            )
-        gs.refresh(force=True)
-        result = await server.get_snapshot_age()
-        assert result["age_seconds"]["research"] is not None
-        assert result["age_seconds"]["buildings"] is not None
+    def test_query_buildings_limit_is_clamped(self, tmp_path: Path) -> None:
+        result = observe.query_buildings(_gs(tmp_path), limit=99999)
+        # no data yet, but limit clamping itself shouldn't raise
+        assert result["results"] == []

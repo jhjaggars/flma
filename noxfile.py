@@ -7,9 +7,7 @@ SRC_DIRS = ["src", "planner", "tests"]
 
 nox.options.sessions = ["lint", "typecheck", "tests"]
 
-MAIN_DEPS = [
-    "mcp[cli]>=1.12",
-]
+MAIN_DEPS: list[str] = []
 TEST_DEPS = ["pytest", "pytest-asyncio", "pytest-cov"]
 
 

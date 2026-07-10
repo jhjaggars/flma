@@ -1,4 +1,4 @@
-# flma — Factorio Live MCP Agent
+# flma — Factorio Live Agent
 
 Ask an AI agent questions about your **running** Factorio game: what you're
 researching, what your iron-plate rate is, what's buffered in your logistics
@@ -10,18 +10,21 @@ flma is two halves with a file-based contract between them:
   small JSON/NDJSON files under `script-output/flma/`. Built to cost ~nothing:
   no `on_tick` polling, engine-aggregated reads, event-driven building
   tracking, everything off by default.
-- **The consumers** — anything that reads those files. This repo ships two: a
-  local **MCP bridge** (`src/`) that serves the data as MCP tools for any
-  agent, and a **factory-planner CLI** (`planner/`). The file formats are the
-  whole interface, documented in [SCHEMA.md](SCHEMA.md) — you can build your
-  own consumer against them without touching the mod.
+- **The consumers** — anything that reads those files. This repo ships one: a
+  local Python **CLI** (`planner/`, backed by the shared reading layer in
+  `src/`) exposing both live-observe commands (research, production,
+  logistics, inventory, buildings) and factory-planning commands. An agent
+  drives it via `Bash` plus the `factorio-live`/`factory-planner` skills — no
+  server process, no protocol handshake. The file formats are the whole
+  interface, documented in [SCHEMA.md](SCHEMA.md) — you can build your own
+  consumer against them without touching the mod.
 
 ```
 Factorio (mod: event-driven + on_nth_tick exports)
    v  writes JSON/NDJSON             <- SCHEMA.md is the contract
 ~/.factorio/script-output/flma/
    v  read by
-MCP bridge (src/)  --MCP over HTTP-->  Claude / any MCP client
+python -m planner <command>  -->  Claude / any agent that can run a shell
 ```
 
 ## Using it
@@ -44,24 +47,21 @@ data export.
 `flma-export-inventories` (player inventories, off by default for privacy).
 Confirm `~/.factorio/script-output/flma/tech.json` appears.
 
-**3. Run the bridge** on the same machine as your Factorio client:
+**3. Query it**, on the same machine as your Factorio client:
 
 ```bash
 uv sync
-SCRIPT_OUTPUT_DIR=~/.factorio/script-output/flma make run
-# serves MCP at http://127.0.0.1:8080/mcp  (loopback-only by default)
+SCRIPT_OUTPUT_DIR=~/.factorio/script-output/flma uv run python -m planner research
+uv run python -m planner production --kind items
+uv run python -m planner status   # feed staleness + modpack alignment
 ```
 
-**4. Connect your agent.** For Claude Code:
+No server to start — each command is a one-shot read of the exported
+snapshot files. Point Claude Code (or any agent that can run a shell and read
+AgentSkills) at this repo and it picks up the `factorio-live` and
+`factory-planner` skills, which teach it the full command surface.
 
-```bash
-claude mcp add --transport http factorio http://localhost:8080/mcp
-```
-
-Any MCP client works the same way — the tools are self-describing. To poke at
-them without an agent: `npx @modelcontextprotocol/inspector http://localhost:8080/mcp`.
-
-**5. Ask questions.**
+**4. Ask questions.**
 
 > "What am I researching and how far along is it?"
 > "What's my iron plate production rate vs. consumption?"
@@ -70,16 +70,18 @@ them without an agent: `npx @modelcontextprotocol/inspector http://localhost:808
 
 ## What the agent can see
 
-| Tool | Answers |
+| Command | Answers |
 |---|---|
-| `get_research_status` | current research, progress, queue |
-| `get_tech_tree` | researched / available / locked technologies |
-| `get_production_stats` | item/fluid lifetime totals and live per-minute rates |
-| `get_logistics` | logistic network contents, robot counts |
-| `get_player_inventory` | a connected player's main inventory (opt-in) |
-| `get_building_counts` | placed-building counts by name/type (opt-in) |
-| `query_buildings` | buildings filtered by name/type/surface/force, with positions |
-| `get_snapshot_age` | staleness of each feed — is the mod actually running? |
+| `research` | current research, progress, queue |
+| `tech-tree` | researched / available / locked technologies |
+| `production` | item/fluid lifetime totals and live per-minute rates |
+| `logistics` | logistic network contents, robot counts |
+| `inventory` | a connected player's main inventory (opt-in) |
+| `buildings` | placed-building counts by name/type, or filtered/listed with positions (opt-in) |
+| `status --json` | staleness of each feed — is the mod actually running? |
+
+Every command accepts `--json` for machine-readable output; see the
+`factorio-live` skill for the full guide.
 
 ## Mod settings (Mod settings → Map)
 
@@ -108,10 +110,10 @@ of all handlers when disabled. Details in [CLAUDE.md](CLAUDE.md).
 |---|---|---|
 | `mod/` | producer | the Factorio mod — self-contained, Lua only |
 | `SCHEMA.md` | contract | exact format of every exported file |
-| `src/` | consumer | the MCP bridge (FastMCP, Streamable HTTP) |
-| `planner/` | consumer | factory-planner CLI (needs a sibling [recipe-mcp](https://github.com/jhjaggars/recipe-mcp) checkout, e.g. `~/code/recipe-mcp`) |
+| `src/` | consumer | shared live-state file-reading layer, used by `planner/` |
+| `planner/` | consumer | the CLI — live-observe commands (`observe.py`) plus the factory-planner (needs a sibling [recipe-mcp](https://github.com/jhjaggars/recipe-mcp) checkout, e.g. `~/code/recipe-mcp`) |
 | `dev/` | mod dev | isolated local server+client environment for developing the mod |
-| `.claude/skills/` | dev | Claude Code skills for mod development and the planner |
+| `.claude/skills/` | dev | Claude Code skills: `factorio-live` (live-observe commands), `factory-planner`, `factorio-dev` (mod development) |
 
 ## Development
 
@@ -126,7 +128,7 @@ See [CLAUDE.md](CLAUDE.md) for architecture and design constraints, and
 ## Status
 
 Verified against a real running Factorio 2.0 client + save: mod loads
-cleanly, settings toggle live, all MCP tools return real data, and the
+cleanly, settings toggle live, all CLI commands return real data, and the
 buildings baseline scan time-slices as designed (a 26k-building base wrote
 its baseline across ~59 ticks, no single-frame spike). Not yet exercised:
 incremental add/remove events under real construction, and a

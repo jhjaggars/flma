@@ -103,6 +103,17 @@ def _rate_per_min_or_default(raw: str | None, unit: str, default: float = 60.0) 
     return default if raw is None else _parse_rate_per_min(raw, unit)
 
 
+def _fmt_watts(watts: float | None) -> str:
+    if watts is None:
+        return "?"
+    magnitude = abs(watts)
+    if magnitude >= 1_000_000:
+        return f"{watts / 1_000_000:.3g} MW"
+    if magnitude >= 1_000:
+        return f"{watts / 1_000:.3g} kW"
+    return f"{watts:.3g} W"
+
+
 def _rate_hint(amount: float | None, probability: float | None, craft_time: float | None) -> str:
     """`amount`x is per craft, not per second — appending the actual
     per-machine rate heads off reading the per-craft batch size as a --rate
@@ -2214,6 +2225,115 @@ async def cmd_consumers(args: argparse.Namespace) -> int:
     return 0
 
 
+_POWER_TABLES: tuple[tuple[str, str], ...] = (
+    ("machine", "machines"),
+    ("drill", "mining_drills"),
+    ("generator", "generators"),
+)
+
+
+async def _resolve_power_entity(
+    engine: ModuleType, query: str
+) -> tuple[str | None, dict | None, list[dict]]:
+    """Resolve an entity id/human name against machines, mining_drills, and
+    generators (in that order). Returns (kind, row, []) on a clean match,
+    (None, None, candidates) when ambiguous or unmatched."""
+    db = engine.db
+    for kind, table in _POWER_TABLES:
+        row = await db.fetch_one(f"SELECT * FROM {table} WHERE name = ?", (query,))
+        if row is not None:
+            return kind, row, []
+    for kind, table in _POWER_TABLES:
+        row = await db.fetch_one(
+            f"SELECT * FROM {table} WHERE translated_name = ? COLLATE NOCASE", (query,)
+        )
+        if row is not None:
+            return kind, row, []
+    candidates: list[dict] = []
+    for kind, table in _POWER_TABLES:
+        rows = await db.fetch_all(
+            f"""SELECT name, translated_name FROM {table}
+                WHERE name LIKE ? COLLATE NOCASE OR translated_name LIKE ? COLLATE NOCASE
+                ORDER BY translated_name COLLATE NOCASE LIMIT 10""",
+            (f"%{query}%", f"%{query}%"),
+        )
+        candidates.extend(
+            {"kind": kind, "name": r["name"], "translated_name": r["translated_name"]} for r in rows
+        )
+    if len(candidates) == 1:
+        kind = candidates[0]["kind"]
+        table = dict(_POWER_TABLES)[kind]
+        row = await db.fetch_one(f"SELECT * FROM {table} WHERE name = ?", (candidates[0]["name"],))
+        return kind, row, []
+    return None, None, candidates
+
+
+async def cmd_power(args: argparse.Namespace) -> int:
+    engine = _make_engine()
+    if engine is None:
+        return 1
+    kind, row, candidates = await _resolve_power_entity(engine, args.entity)
+    if row is None:
+        if not candidates:
+            print(f"no machine, drill, or generator found matching '{args.entity}'.")
+            return 1
+        print(f"'{args.entity}' is ambiguous — candidates:")
+        for c in candidates:
+            print(f"  {c['name']:<32} ({c['kind']})  {c['translated_name']}")
+        return 1
+
+    print(f"{row['name']}  ({row['translated_name']})  [{kind}]")
+
+    if kind == "generator":
+        print(f"  max power output: {_fmt_watts(row['max_power_output'])}")
+        if row["input_fluid"]:
+            usage = row["fluid_usage_per_sec"]
+            usage_str = f"{_fmt_num(usage)}/s" if usage is not None else "?"
+            print(f"  input fluid: {row['input_fluid']}  ({usage_str} at max output)")
+        if row["effectivity"] is not None:
+            print(f"  effectivity: {row['effectivity']}")
+        if row["maximum_temperature"] is not None:
+            print(f"  maximum temperature: {row['maximum_temperature']}")
+        return 0
+
+    # machine or drill
+    energy_source = row["energy_source"]
+    if energy_source == "electric":
+        print(f"  energy consumption: {_fmt_watts(row['energy_consumption'])}  (electric)")
+        return 0
+    if energy_source != "burner":
+        print("  no energy data exported for this entity.")
+        return 0
+
+    print(f"  energy consumption: {_fmt_watts(row['energy_consumption'])}  (burner)")
+    effectivity = row["burner_effectivity"] if row["burner_effectivity"] is not None else 1.0
+    fuels = await engine.db.fetch_all(
+        """SELECT f.name, f.translated_name, f.fuel_value
+           FROM machine_fuel_categories mfc
+           JOIN fuels f ON f.fuel_category = mfc.fuel_category
+           WHERE mfc.machine_name = ?
+           ORDER BY f.translated_name COLLATE NOCASE""",
+        (row["name"],),
+    )
+    if not fuels:
+        print(
+            "  no eligible fuels found (fuel_categories/fuel_value not exported for this "
+            "entity, or the DB predates this — rebuild from a fresh recipes.json)."
+        )
+        return 0
+    energy_consumption = row["energy_consumption"] or 0.0
+    print("  eligible fuels (burn rate at full load):")
+    for f in fuels:
+        if not f["fuel_value"]:
+            continue
+        burn_per_sec = energy_consumption / (f["fuel_value"] * effectivity)
+        print(
+            f"    {f['name']:<24} ({f['translated_name']})  "
+            f"{_fmt_num(burn_per_sec)}/s  {_fmt_num(burn_per_sec * 60)}/min"
+        )
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # have — live-only: what do I already produce/store
 # ---------------------------------------------------------------------------
@@ -2619,6 +2739,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", default="player", help="Factorio force to scope tech-status to (default: player)"
     )
 
+    p_power = sub.add_parser(
+        "power",
+        help=(
+            "power stats for a machine/drill/generator (exact id or human name) — "
+            "burner fuel burn rate, or generator max output/fluid usage"
+        ),
+    )
+    p_power.add_argument("entity", help="machine/drill/generator id or human name")
+
     p_have = sub.add_parser(
         "have", help="live net production + buffered stock for one or more items (exact id)"
     )
@@ -2762,6 +2891,7 @@ _HANDLERS = {
     "recipe": cmd_recipe,
     "producers": cmd_producers,
     "consumers": cmd_consumers,
+    "power": cmd_power,
     "have": cmd_have,
     "belts": cmd_belts,
     "tech": cmd_tech,

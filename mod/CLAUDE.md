@@ -88,7 +88,7 @@ clobbering a different save's files. A small fixed-location pointer,
 | `<save_id>/production.json` | every `flma-tick-interval` (full overwrite) | per-force, per-surface item/fluid `input_counts`/`output_counts` (lifetime cumulative totals) **and** `input_rates_per_min`/`output_rates_per_min` (real per-minute flow, via `get_flow_count`) |
 | `<save_id>/logistics.json` | every `flma-tick-interval` (full overwrite) | per-force logistic networks: contents, robot counts |
 | `<save_id>/inventories.json` | every `flma-tick-interval`, if enabled (full overwrite) | connected players' main inventory contents |
-| `<save_id>/recipes.json` | on init / mod-config change / recipe-affecting research (coalesced) / translation completion / `remote.call("flma","export_recipes")` — never periodic (full overwrite, ~11 MB) | RecipeExporter-compatible dump of recipes, items, fluids, machines/drills/resources, technologies, qualities, groups (player force); `translated_name` filled in best-effort once a connected player's translation pass completes |
+| `<save_id>/recipes.json` | on init / mod-config change / recipe-affecting research (coalesced) / translation completion / `remote.call("flma","export_recipes")` — never periodic (full overwrite, ~11 MB) | RecipeExporter-compatible dump of recipes, items, fluids, machines/drills/resources/generators, technologies, qualities, groups (player force); `translated_name` filled in best-effort once a connected player's translation pass completes |
 | `<save_id>/buildings.ndjson` | on build/mine events (append), periodically compacted | `{"op":"add"/"remove", "entity":{...}}` event log |
 
 ## Debugging

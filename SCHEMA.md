@@ -261,7 +261,7 @@ Top-level object:
   "recipes":       { "<name>": { "...see below..." } },
   "items":         { "<name>": { "name", "type", "order", "group", "subgroup", "stack_size", "weight", "fuel_category?", "fuel_value", "module_effects?", "rocket_launch_products", "flags?" } },
   "fluids":        { "<name>": { "name", "order", "group", "subgroup", "fuel_value" } },
-  "entities":      { "<name>": { "...three shapes, see below..." } },
+  "entities":      { "<name>": { "...four shapes, see below..." } },
   "technologies":  { "<name>": { "...see below..." } }
 }
 ```
@@ -292,14 +292,26 @@ A recipe:
 
 - Products with a random yield carry `amount_min`/`amount_max` instead of
   `amount` (e.g. uranium processing), plus `probability`.
-- `entities` holds three shapes distinguished by `type`: **crafting machines**
+- `entities` holds four shapes distinguished by `type`: **crafting machines**
   (`beacon`/`furnace`/`assembling-machine`/`boiler`/`rocket-silo` —
   `crafting_categories`, per-quality `crafting_speed` map,
   `module_inventory_size`, `energy_consumption`/`drain` in W,
   `energy_source: "electric"|"burner"`, `width`/`height`, …), **mining drills**
-  (`resource_categories`, `mining_speed`, energy fields), and **resources**
+  (`resource_categories`, `mining_speed`, energy fields), **resources**
   (`resource_category`, `mining_time`, `required_fluid?`, `fluid_amount?`,
-  `product_name`).
+  `product_name`), and **generators** (`type == "generator"` only — fluid-driven
+  electricity generators like `steam-engine` or pyanodons' `steam-turbine-mk01`:
+  `max_power_output` in W, `fluid_usage_per_sec`, `effectivity`,
+  `maximum_temperature`, `input_fluid?` — the fluid name from the entity's input
+  fluidbox filter, absent if the generator has no filtered fluidbox).
+  Crafting machines and mining drills with `energy_source == "burner"` also
+  carry `burner_effectivity?` (their `LuaBurnerPrototype.effectivity`, needed
+  together with an item's `fuel_value` to compute an exact fuel burn rate).
+  **Excluded on purpose:** `electric-energy-interface` entities (e.g.
+  pyanodons' wind turbines) have no static prototype power figure — their
+  output is live per-instance state (`LuaEntity.power_production`) that their
+  owning mod adjusts at runtime, not something a static prototype dump can
+  represent.
 - A technology: `enabled`, `researched`, `prerequisites[]`,
   `recipes_unlocked[]` (recipe names from its `unlock-recipe` effects),
   `unit_count?`, `unit_count_formula?`, `unit_energy`, `unit_ingredients[]`

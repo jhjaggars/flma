@@ -12,6 +12,7 @@ from planner import cli, config
 from planner.cli import (
     _apply_mining_productivity_to_drills,
     _fastest_buildable_belt_tier,
+    _fmt_watts,
     _is_tech_locked,
     _parse_rate_per_min,
     _print_tree,
@@ -412,3 +413,208 @@ class TestLiveObserveCommands:
         assert await cli.cmd_buildings(args) == 0
         out = json.loads(capsys.readouterr().out)
         assert out["total"] == 0
+
+
+class TestFmtWatts:
+    def test_none_is_unknown(self) -> None:
+        assert _fmt_watts(None) == "?"
+
+    def test_watts_below_1000(self) -> None:
+        assert _fmt_watts(500) == "500 W"
+
+    def test_kilowatts(self) -> None:
+        assert _fmt_watts(90000) == "90 kW"
+
+    def test_megawatts(self) -> None:
+        assert _fmt_watts(7880000) == "7.88 MW"
+
+
+class _FakePowerDB:
+    """Duck-typed stand-in for recipe-mcp's engine.db — only the query
+    shapes `_resolve_power_entity`/`cmd_power` actually issue against
+    machines/mining_drills/generators/fuels/machine_fuel_categories."""
+
+    _TABLES = ("machines", "mining_drills", "generators")
+
+    def __init__(
+        self,
+        machines: list[dict] | None = None,
+        mining_drills: list[dict] | None = None,
+        generators: list[dict] | None = None,
+        fuels: list[dict] | None = None,
+        machine_fuel_categories: list[dict] | None = None,
+    ) -> None:
+        self.machines = machines or []
+        self.mining_drills = mining_drills or []
+        self.generators = generators or []
+        self.fuels = fuels or []
+        self.machine_fuel_categories = machine_fuel_categories or []
+
+    def _rows_for(self, query: str) -> list[dict]:
+        for table in self._TABLES:
+            if f"FROM {table}" in query:
+                return getattr(self, table)
+        raise AssertionError(f"unrecognized table in query: {query}")
+
+    async def fetch_one(self, query: str, params: tuple = ()) -> dict | None:
+        rows = self._rows_for(query)
+        (value,) = params
+        if "translated_name = ?" in query:
+            for row in rows:
+                if row["translated_name"].lower() == value.lower():
+                    return row
+            return None
+        for row in rows:
+            if row["name"] == value:
+                return row
+        return None
+
+    async def fetch_all(self, query: str, params: tuple) -> list[dict]:
+        if "JOIN fuels" in query:
+            (machine_name,) = params
+            categories = {
+                r["fuel_category"]
+                for r in self.machine_fuel_categories
+                if r["machine_name"] == machine_name
+            }
+            matches = [f for f in self.fuels if f["fuel_category"] in categories]
+            return sorted(matches, key=lambda f: f["translated_name"].lower())
+        rows = self._rows_for(query)
+        needle, _ = params
+        needle = needle.strip("%").lower()
+        matches = [
+            {"name": r["name"], "translated_name": r["translated_name"]}
+            for r in rows
+            if needle in r["name"].lower() or needle in r["translated_name"].lower()
+        ]
+        return matches[:10]
+
+
+class _FakePowerEngine:
+    def __init__(self, db: _FakePowerDB) -> None:
+        self.db = db
+
+
+COAL_POWERPLANT = {
+    "name": "py-coal-powerplant-mk01",
+    "translated_name": "Coal powerplant MK 01",
+    "energy_consumption": 10_000_000.0,
+    "energy_source": "burner",
+    "burner_effectivity": 1.0,
+}
+ELECTRIC_DRILL = {
+    "name": "electric-mining-drill",
+    "translated_name": "Electric mining drill",
+    "energy_consumption": 90_000.0,
+    "energy_source": "electric",
+    "burner_effectivity": None,
+}
+STEAM_TURBINE = {
+    "name": "steam-turbine-mk01",
+    "translated_name": "Steam turbine MK01",
+    "max_power_output": 7_880_000.0,
+    "fluid_usage_per_sec": 60.0,
+    "input_fluid": "pressured-steam",
+    "effectivity": 1.0,
+    "maximum_temperature": 1000.0,
+}
+COAL_FUEL = {
+    "name": "coal",
+    "translated_name": "Coal",
+    "fuel_category": "chemical",
+    "fuel_value": 8_000_000.0,
+}
+
+
+class TestCmdPower:
+    def _engine(self) -> _FakePowerEngine:
+        return _FakePowerEngine(
+            _FakePowerDB(
+                machines=[COAL_POWERPLANT],
+                mining_drills=[ELECTRIC_DRILL],
+                generators=[STEAM_TURBINE],
+                fuels=[COAL_FUEL],
+                machine_fuel_categories=[
+                    {"machine_name": "py-coal-powerplant-mk01", "fuel_category": "chemical"}
+                ],
+            )
+        )
+
+    async def test_burner_machine_prints_burn_rate(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(cli, "_make_engine", lambda: self._engine())
+        args = argparse.Namespace(entity="py-coal-powerplant-mk01")
+        assert await cli.cmd_power(args) == 0
+        out = capsys.readouterr().out
+        assert "10 MW" in out
+        assert "coal" in out
+        # 10,000,000 W / (8,000,000 J * 1.0 effectivity) = 1.25/s = 75/min
+        assert "1.25/s" in out
+        assert "75/min" in out
+
+    async def test_generator_prints_output_and_fluid_usage(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(cli, "_make_engine", lambda: self._engine())
+        args = argparse.Namespace(entity="steam-turbine-mk01")
+        assert await cli.cmd_power(args) == 0
+        out = capsys.readouterr().out
+        assert "7.88 MW" in out
+        assert "pressured-steam" in out
+        assert "60/s" in out
+
+    async def test_electric_machine_has_no_fuel_section(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(cli, "_make_engine", lambda: self._engine())
+        args = argparse.Namespace(entity="electric-mining-drill")
+        assert await cli.cmd_power(args) == 0
+        out = capsys.readouterr().out
+        assert "90 kW" in out
+        assert "electric" in out
+        assert "fuel" not in out
+
+    async def test_fuzzy_single_match_resolves(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(cli, "_make_engine", lambda: self._engine())
+        args = argparse.Namespace(entity="turbine")
+        assert await cli.cmd_power(args) == 0
+        out = capsys.readouterr().out
+        assert "steam-turbine-mk01" in out
+
+    async def test_no_match_returns_error(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(cli, "_make_engine", lambda: self._engine())
+        args = argparse.Namespace(entity="nonexistent-thing")
+        assert await cli.cmd_power(args) == 1
+        assert "no machine, drill, or generator found" in capsys.readouterr().out
+
+    async def test_ambiguous_match_returns_error(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        engine = _FakePowerEngine(
+            _FakePowerDB(
+                machines=[
+                    COAL_POWERPLANT,
+                    {**COAL_POWERPLANT, "name": "py-coal-powerplant-mk02"},
+                ]
+            )
+        )
+        monkeypatch.setattr(cli, "_make_engine", lambda: engine)
+        args = argparse.Namespace(entity="coal-powerplant")
+        assert await cli.cmd_power(args) == 1
+        assert "ambiguous" in capsys.readouterr().out
+
+    async def test_burner_with_no_eligible_fuels_shown_gracefully(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """DB predates fuel export (empty fuels/machine_fuel_categories) --
+        must not crash, just say so."""
+        engine = _FakePowerEngine(_FakePowerDB(machines=[COAL_POWERPLANT]))
+        monkeypatch.setattr(cli, "_make_engine", lambda: engine)
+        args = argparse.Namespace(entity="py-coal-powerplant-mk01")
+        assert await cli.cmd_power(args) == 0
+        assert "no eligible fuels found" in capsys.readouterr().out

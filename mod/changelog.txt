@@ -1,4 +1,17 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.3
+Date: 2026-07-10
+  Changes:
+    - recipes.json entities now include a fourth "generator" shape (fluid-driven
+      electricity generators, e.g. steam-engine, steam-turbine-mk01..04):
+      max_power_output (W), fluid_usage_per_sec, effectivity, maximum_temperature,
+      input_fluid. Deliberately excludes "electric-energy-interface" entities
+      (e.g. pyanodons' wind turbines) -- their power output is live per-instance
+      state set by their owning mod's own simulation, not static prototype data.
+    - Crafting-machine and mining-drill entities with a burner energy source now
+      also report burner_effectivity, needed to compute exact fuel burn rates
+      from an item's fuel_value (already exported, previously unused downstream).
+---------------------------------------------------------------------------------------------------
 Version: 0.3.2
 Date: 2026-07-07
   Changes:

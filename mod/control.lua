@@ -834,6 +834,7 @@ local function build_recipes_export()
       local drain = nil
       local energy_source = nil
       local fuel_categories = nil
+      local burner_effectivity = nil
       if v.electric_energy_source_prototype and v.energy_usage ~= nil then
         energy_consumption = v.energy_usage * 60
         drain = v.electric_energy_source_prototype.drain * 60
@@ -843,6 +844,7 @@ local function build_recipes_export()
         drain = 0
         energy_source = "burner"
         fuel_categories = table_keys(v.burner_prototype.fuel_categories)
+        burner_effectivity = v.burner_prototype.effectivity
       end
       local entity_info = {
         name = v.name,
@@ -864,6 +866,7 @@ local function build_recipes_export()
         drain = drain,
         energy_source = energy_source,
         fuel_categories = fuel_categories,
+        burner_effectivity = burner_effectivity,
         width = v.tile_width,
         height = v.tile_height,
         flags = table_keys(v.flags),
@@ -885,6 +888,7 @@ local function build_recipes_export()
       local drain = nil
       local energy_source = nil
       local fuel_categories = nil
+      local burner_effectivity = nil
       if v.electric_energy_source_prototype and v.energy_usage ~= nil then
         energy_consumption = v.energy_usage * 60
         drain = v.electric_energy_source_prototype.drain * 60
@@ -894,6 +898,7 @@ local function build_recipes_export()
         drain = 0
         energy_source = "burner"
         fuel_categories = table_keys(v.burner_prototype.fuel_categories)
+        burner_effectivity = v.burner_prototype.effectivity
       end
       data.entities[v.name] = {
         name = v.name,
@@ -905,6 +910,7 @@ local function build_recipes_export()
         drain = drain,
         energy_source = energy_source,
         fuel_categories = fuel_categories,
+        burner_effectivity = burner_effectivity,
         width = v.tile_width,
         height = v.tile_height,
         translated_name = tr("entities", v.name),
@@ -923,6 +929,34 @@ local function build_recipes_export()
           translated_name = tr("entities", v.name),
         }
       end
+    elseif etype == "generator" then
+      -- Fluid-driven electricity generators (e.g. vanilla steam-engine, or
+      -- pyanodons' steam-turbine-mk01..04). Deliberately excludes
+      -- "electric-energy-interface" entities (e.g. pyanodons' wind
+      -- turbines) -- those have no static prototype power figure at all;
+      -- their output is live per-instance state (LuaEntity.power_production,
+      -- adjusted at runtime by their owning mod's own simulation), not
+      -- prototype data this export can represent.
+      local input_fluid = nil
+      local fb = v.fluidbox_prototypes
+      if fb and fb[1] and fb[1].filter then
+        input_fluid = fb[1].filter.name
+      end
+      data.entities[v.name] = {
+        name = v.name,
+        type = etype,
+        order = v.order,
+        group = v.group.name,
+        subgroup = v.subgroup.name,
+        max_power_output = v.max_power_output,
+        fluid_usage_per_sec = v.fluid_usage_per_tick and (v.fluid_usage_per_tick * 60) or nil,
+        effectivity = v.effectivity,
+        maximum_temperature = v.maximum_temperature,
+        input_fluid = input_fluid,
+        width = v.tile_width,
+        height = v.tile_height,
+        translated_name = tr("entities", v.name),
+      }
     end
   end
 
@@ -1172,7 +1206,8 @@ local function start_translation_pass(player)
   for _, v in pairs(prototypes.entity) do
     local etype = v.type
     if etype == "beacon" or etype == "furnace" or etype == "assembling-machine"
-        or etype == "boiler" or etype == "rocket-silo" or etype == "mining-drill" then
+        or etype == "boiler" or etype == "rocket-silo" or etype == "mining-drill"
+        or etype == "generator" then
       enqueue("entities", v.name)
     elseif etype == "resource" then
       local mp = v.mineable_properties

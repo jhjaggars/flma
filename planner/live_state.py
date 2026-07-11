@@ -115,6 +115,26 @@ def building_counts(gs: GameState, force: str = "player") -> dict[str, int]:
     return counts
 
 
+def buildings_by_recipe(gs: GameState, force: str = "player") -> dict[str, int]:
+    """Placed-building counts by *currently configured recipe* (the `recipe`
+    field on assembling machines/furnaces/rocket silos, mod 0.3.5+), for
+    `force`. A strictly stronger reuse signal than `building_counts`' bare
+    machine-type counts: having 5 assembling machines of the right type
+    doesn't tell you whether any of them are already doing this exact job or
+    are all busy on something else, but this does. Buildings with no recipe
+    configured (idle, or a non-recipe-capable type) are excluded rather than
+    counted under a `None` key."""
+    counts: dict[str, int] = {}
+    for b in gs.get_buildings():
+        if b.get("force") != force:
+            continue
+        recipe = b.get("recipe")
+        if recipe is None:
+            continue
+        counts[recipe] = counts.get(recipe, 0) + 1
+    return counts
+
+
 def modpack_alignment(
     gs: GameState, db_tech_ids: set[str], force: str = "player"
 ) -> dict[str, Any]:

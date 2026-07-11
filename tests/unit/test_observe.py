@@ -367,19 +367,22 @@ class TestBuildingsFunctions:
                     ("stone-furnace", "furnace"),
                 ]
             ):
+                entity = {
+                    "id": i,
+                    "name": name,
+                    "type": typ,
+                    "surface": "nauvis",
+                    "force": "player",
+                    "position": {"x": i, "y": 0},
+                }
+                if typ == "furnace":
+                    entity["recipe"] = "iron-plate"
                 f.write(
                     json.dumps(
                         {
                             "t": i,
                             "op": "add",
-                            "entity": {
-                                "id": i,
-                                "name": name,
-                                "type": typ,
-                                "surface": "nauvis",
-                                "force": "player",
-                                "position": {"x": i, "y": 0},
-                            },
+                            "entity": entity,
                         }
                     )
                     + "\n"
@@ -394,6 +397,10 @@ class TestBuildingsFunctions:
         query = observe.query_buildings(gs, name="stone-furnace")
         assert query["total_matches"] == 1
         assert query["results"][0]["position"] == {"x": 2, "y": 0}
+        # recipe is absent-not-null upstream (mod/control.lua building_record);
+        # query_buildings/BuildingIndex pass whatever the record has through
+        # unchanged, so it should survive the round trip.
+        assert query["results"][0]["recipe"] == "iron-plate"
 
     def test_query_buildings_limit_is_clamped(self, tmp_path: Path) -> None:
         result = observe.query_buildings(_gs(tmp_path), limit=99999)

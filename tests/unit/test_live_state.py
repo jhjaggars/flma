@@ -23,19 +23,18 @@ def write_ndjson(path: Path, events: list[dict]) -> None:
     path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
 
 
-def _add_event(entity_id: int, name: str, force: str = "player") -> dict:
-    return {
-        "t": entity_id,
-        "op": "add",
-        "entity": {
-            "id": entity_id,
-            "name": name,
-            "type": "mining-drill",
-            "surface": "nauvis",
-            "position": {"x": 0.0, "y": 0.0},
-            "force": force,
-        },
+def _add_event(entity_id: int, name: str, force: str = "player", recipe: str | None = None) -> dict:
+    entity = {
+        "id": entity_id,
+        "name": name,
+        "type": "mining-drill",
+        "surface": "nauvis",
+        "position": {"x": 0.0, "y": 0.0},
+        "force": force,
     }
+    if recipe is not None:
+        entity["recipe"] = recipe
+    return {"t": entity_id, "op": "add", "entity": entity}
 
 
 def _production_with_rates(surface_items: dict, surface_fluids: dict | None = None) -> dict:
@@ -177,6 +176,34 @@ class TestBuildingCounts:
         gs = GameState(tmp_path, min_refresh_interval=0)
         counts = live_state.building_counts(gs, force="player")
         assert counts == {}
+
+
+class TestBuildingsByRecipe:
+    def test_counts_by_configured_recipe_for_force(self, tmp_path: Path) -> None:
+        write_ndjson(
+            tmp_path / "buildings.ndjson",
+            [
+                _add_event(1, "assembling-machine-2", recipe="iron-gear-wheel"),
+                _add_event(2, "assembling-machine-2", recipe="iron-gear-wheel"),
+                _add_event(3, "stone-furnace", recipe="iron-plate"),
+                _add_event(4, "assembling-machine-2", force="enemy", recipe="iron-gear-wheel"),
+            ],
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        counts = live_state.buildings_by_recipe(gs, force="player")
+        assert counts == {"iron-gear-wheel": 2, "iron-plate": 1}
+
+    def test_buildings_with_no_recipe_are_excluded(self, tmp_path: Path) -> None:
+        write_ndjson(
+            tmp_path / "buildings.ndjson",
+            [_add_event(1, "wooden-chest"), _add_event(2, "assembling-machine-2")],
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert live_state.buildings_by_recipe(gs, force="player") == {}
+
+    def test_no_buildings_file_returns_empty(self, tmp_path: Path) -> None:
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert live_state.buildings_by_recipe(gs, force="player") == {}
 
 
 class TestMiningDrillProductivityBonus:

@@ -11,6 +11,7 @@ import pytest
 from planner import cli, config
 from planner.cli import (
     _apply_mining_productivity_to_drills,
+    _collect_recipe_selections,
     _fastest_buildable_belt_tier,
     _fmt_watts,
     _is_tech_locked,
@@ -46,6 +47,56 @@ class TestIsTechLocked:
 
     def test_no_notes(self) -> None:
         assert _is_tech_locked("sand", []) is False
+
+
+class TestCollectRecipeSelections:
+    """_collect_recipe_selections walks an _expand_node tree collecting
+    {item_id: chosen_recipe_id} for every non-leaf node — the data
+    _plan_reuse_candidates cross-references against live_state.buildings_by_recipe
+    to find machines already configured for one of the plan's exact recipes."""
+
+    def test_top_level_and_nested_recipes_collected(self) -> None:
+        tree = {
+            "id": "iron-gear-wheel",
+            "leaf": False,
+            "recipe": {"id": "iron-gear-wheel", "name": "Iron gear wheel"},
+            "ingredients": [
+                {
+                    "id": "iron-plate",
+                    "leaf": False,
+                    "recipe": {"id": "iron-plate", "name": "Iron plate"},
+                    "ingredients": [
+                        {"id": "iron-ore", "leaf": True, "amount": 10.0, "stop_reason": "raw"}
+                    ],
+                }
+            ],
+        }
+        out: dict[str, str] = {}
+        _collect_recipe_selections(tree, out)
+        assert out == {"iron-gear-wheel": "iron-gear-wheel", "iron-plate": "iron-plate"}
+
+    def test_leaf_nodes_contribute_nothing(self) -> None:
+        out: dict[str, str] = {}
+        _collect_recipe_selections({"id": "iron-ore", "leaf": True}, out)
+        assert out == {}
+
+    def test_node_with_no_recipe_id_is_skipped_but_children_still_walked(self) -> None:
+        tree = {
+            "id": "mystery-item",
+            "leaf": False,
+            "recipe": {},
+            "ingredients": [
+                {
+                    "id": "sand",
+                    "leaf": False,
+                    "recipe": {"id": "sand-recipe"},
+                    "ingredients": [],
+                }
+            ],
+        }
+        out: dict[str, str] = {}
+        _collect_recipe_selections(tree, out)
+        assert out == {"sand": "sand-recipe"}
 
 
 class TestPrintTreeAlternates:
@@ -413,6 +464,56 @@ class TestLiveObserveCommands:
         assert await cli.cmd_buildings(args) == 0
         out = json.loads(capsys.readouterr().out)
         assert out["total"] == 0
+
+    async def test_buildings_list_shows_recipe_when_present(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._point_at(monkeypatch, tmp_path)
+        (tmp_path / "buildings.ndjson").write_text(
+            json.dumps(
+                {
+                    "t": 1,
+                    "op": "add",
+                    "entity": {
+                        "id": 1,
+                        "name": "assembling-machine-2",
+                        "type": "assembling-machine",
+                        "surface": "nauvis",
+                        "force": "player",
+                        "position": {"x": 0, "y": 0},
+                        "recipe": "iron-gear-wheel",
+                    },
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "t": 2,
+                    "op": "add",
+                    "entity": {
+                        "id": 2,
+                        "name": "wooden-chest",
+                        "type": "container",
+                        "surface": "nauvis",
+                        "force": "player",
+                        "position": {"x": 1, "y": 0},
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        args = argparse.Namespace(
+            name=None, type=None, surface=None, force=None, list=True, limit=100, json=False
+        )
+        assert await cli.cmd_buildings(args) == 0
+        out = capsys.readouterr().out
+        assert "assembling-machine-2" in out
+        assert "recipe=iron-gear-wheel" in out
+        # A building with no recipe field (or a non-recipe-capable type)
+        # shouldn't grow a spurious "recipe=" suffix.
+        chest_line = next(line for line in out.splitlines() if "wooden-chest" in line)
+        assert "recipe=" not in chest_line
 
 
 class TestFmtWatts:

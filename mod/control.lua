@@ -177,6 +177,27 @@ local BASELINE_CHUNK_SIZE = 500
 -- megabase just takes more ticks overall, never a bigger single-tick spike.
 local BASELINE_CHUNKS_PER_TICK = 5
 
+-- The only entity types whose LuaEntity supports get_recipe()/set_recipe()
+-- (a live "current recipe" slot) at runtime. recipes.json's static entity
+-- dump groups beacon/boiler in with these as "crafting machines" too, but
+-- that's about prototype metadata (crafting_categories) for recipe-machine
+-- matching — neither beacon nor boiler actually holds a live recipe, so
+-- calling get_recipe() on one is not supported. Checked before every
+-- get_recipe() call so we never call it on an unsupported type.
+local RECIPE_CAPABLE_TYPES = {
+  ["assembling-machine"] = true,
+  ["furnace"] = true,
+  ["rocket-silo"] = true,
+}
+
+-- Number of recipe-capable buildings whose live recipe is re-checked per
+-- tick-interval cycle by rescan_recipes() below. Bounds that sweep's cost
+-- regardless of base size — a megabase just takes more cycles to fully
+-- sweep once, never a bigger single-cycle spike, mirroring the baseline
+-- scan's chunking rationale. See rescan_recipes()'s own comment for why a
+-- periodic sweep is needed at all alongside the event-driven paths.
+local RECIPE_RESCAN_BATCH_SIZE = 200
+
 --------------------------------------------------------------------------------
 -- settings helpers
 --------------------------------------------------------------------------------
@@ -464,7 +485,7 @@ end
 
 local function building_record(entity)
   local pos = entity.position
-  return {
+  local rec = {
     id = entity.unit_number,
     name = entity.name,
     type = entity.type,
@@ -472,6 +493,13 @@ local function building_record(entity)
     position = { x = pos.x, y = pos.y },
     force = entity.force and entity.force.name or nil,
   }
+  if RECIPE_CAPABLE_TYPES[entity.type] then
+    local recipe = entity.get_recipe()
+    if recipe then
+      rec.recipe = recipe.name
+    end
+  end
+  return rec
 end
 
 -- Updates the in-memory index only — no disk write. Returns the record on
@@ -487,6 +515,12 @@ local function apply_build(entity)
   end
   storage.flma.buildings[rec.id] = rec
   storage.flma.building_lines_since_compact = storage.flma.building_lines_since_compact + 1
+  if RECIPE_CAPABLE_TYPES[entity.type] then
+    -- Cached so rescan_recipes() and the settings-pasted/gui-closed handlers
+    -- can call get_recipe() directly instead of needing a (nonexistent)
+    -- lookup-entity-by-unit_number API.
+    storage.flma.recipe_entities[rec.id] = entity
+  end
   return rec
 end
 
@@ -507,6 +541,7 @@ local function record_remove(entity)
     storage.flma.buildings[id] = nil
     storage.flma.building_count = storage.flma.building_count - 1
     storage.flma.building_lines_since_compact = storage.flma.building_lines_since_compact + 1
+    storage.flma.recipe_entities[id] = nil
     append_line("buildings", { t = game.tick, op = "remove", id = id })
     storage.flma.building_total_lines = storage.flma.building_total_lines + 1
   end
@@ -549,6 +584,85 @@ local function maybe_compact_buildings()
   if storage.flma.building_total_lines >= 2 * storage.flma.building_count then
     compact_buildings()
   end
+end
+
+-- Re-reads an already-tracked recipe-capable entity's live recipe and, if it
+-- differs from what's indexed, re-emits an "add" — the same upsert used for
+-- a live build — so buildings.ndjson picks up the change under the existing
+-- fold-into-a-map semantics (see ../SCHEMA.md buildings.ndjson). No new op
+-- type needed: record_build() already recomputes the full record (position,
+-- force, recipe, …) from the live entity and overwrites the indexed one.
+-- Called from three event handlers below and from rescan_recipes(); O(1)
+-- per call (one get_recipe() read plus, only on an actual change, one
+-- append).
+local function refresh_recipe_if_changed(entity)
+  if not entity or not entity.valid or not entity.unit_number then
+    return
+  end
+  if not RECIPE_CAPABLE_TYPES[entity.type] then
+    return
+  end
+  local existing = storage.flma.buildings[entity.unit_number]
+  local recipe = entity.get_recipe()
+  local new_name = recipe and recipe.name or nil
+  local old_name = existing and existing.recipe or nil
+  if new_name ~= old_name then
+    record_build(entity)
+    maybe_compact_buildings()
+  end
+end
+
+-- Bounded, resumable sweep over every recipe-capable building's live
+-- recipe, run once per tick-interval cycle (see reschedule()'s on_nth_tick
+-- registration). This is the ONLY signal that catches a circuit-network
+-- "Set recipe" change: Factorio raises no event at all for one (the engine
+-- only re-evaluates the circuit condition when the machine finishes its
+-- current craft, entirely inside the simulation), so the three event
+-- handlers below (on_entity_settings_pasted, on_blueprint_settings_pasted,
+-- on_gui_closed) are necessary but not sufficient — see ../SCHEMA.md's
+-- buildings.ndjson section for the full breakdown of what each signal does
+-- and doesn't cover.
+--
+-- Uses Lua's stateless `next()` to resume from where the previous cycle
+-- left off rather than re-walking the whole table, so cost is bounded by
+-- RECIPE_RESCAN_BATCH_SIZE regardless of how many recipe-capable buildings
+-- exist — a megabase just takes more cycles for one full sweep, never a
+-- bigger single-cycle spike (same rationale as the baseline scan's
+-- chunking). Entities found invalid (mined without going through
+-- record_remove, e.g. some other mod's entity.destroy()) are removed after
+-- the sweep completes rather than mid-loop, since Lua's `next` requires its
+-- reference key to still exist in the table at call time — deleting the
+-- *current* key and then passing it as next's reference key on the
+-- following call is the classic use-after-free-key mistake for this idiom.
+local function rescan_recipes()
+  local entities = storage.flma.recipe_entities
+  local cursor = storage.flma.recipe_rescan_cursor
+  if cursor ~= nil and entities[cursor] == nil then
+    -- Cursor entity was removed since the last cycle; restart the sweep
+    -- rather than handing next() a key that's no longer in the table.
+    cursor = nil
+  end
+  local stale = nil
+  for _ = 1, RECIPE_RESCAN_BATCH_SIZE do
+    local id, entity = next(entities, cursor)
+    if id == nil then
+      cursor = nil
+      break
+    end
+    cursor = id
+    if entity.valid then
+      refresh_recipe_if_changed(entity)
+    else
+      stale = stale or {}
+      stale[#stale + 1] = id
+    end
+  end
+  if stale then
+    for _, id in ipairs(stale) do
+      entities[id] = nil
+    end
+  end
+  storage.flma.recipe_rescan_cursor = cursor
 end
 
 -- Time-sliced baseline scan, in two phases so nothing does O(#entities) or
@@ -1280,6 +1394,28 @@ local function ensure_storage()
   if storage.flma.tracking_was_active == nil then
     storage.flma.tracking_was_active = false
   end
+  if storage.flma.recipe_entities == nil then
+    storage.flma.recipe_entities = {}
+    if storage.flma.buildings_initialized then
+      -- Upgrading from a mod version that predates recipe tracking on a save
+      -- that already completed a baseline scan: existing buildings have no
+      -- cached LuaEntity reference for get_recipe() (there is no
+      -- lookup-entity-by-unit_number API to backfill one from the plain
+      -- stored record), so force one fresh baseline rescan — clearing
+      -- buildings_initialized re-triggers start_baseline_scan() in
+      -- reschedule() below, which is already time-sliced across ticks like
+      -- any other baseline scan, not a shortcut around the
+      -- never-find_entities_filtered-on-a-schedule rule. This runs at most
+      -- once per save (recipe_entities is non-nil from here on, even while
+      -- empty).
+      storage.flma.buildings = {}
+      storage.flma.building_count = 0
+      storage.flma.buildings_initialized = false
+      storage.flma.building_lines_since_compact = 0
+      storage.flma.building_total_lines = 0
+      helpers.write_file(output_dir() .. "/buildings.ndjson", "", false) -- truncate
+    end
+  end
   storage.flma.recipe_translations = storage.flma.recipe_translations or empty_translation_tables()
   if storage.flma.recipes_dirty == nil then
     storage.flma.recipes_dirty = false
@@ -1324,6 +1460,38 @@ local function on_destroy_event(event)
   maybe_compact_buildings()
 end
 
+-- Three of the four ways a placed machine's recipe can change after it's
+-- built (the fourth, circuit-network "Set recipe", raises no event at all —
+-- see rescan_recipes()). None of these need BUILDING_EVENT_FILTERS: that
+-- shape only applies to entity-creation/destruction events, and each
+-- handler's cost is bounded by player-action frequency (copy-paste tool
+-- use, blueprint pastes, GUI closes), not by base size or tick rate, so
+-- there's no scan-cost rule being bent by leaving them unfiltered.
+--
+-- Copy/paste tool (shift-click drag, or the "paste entity settings" hotkey)
+-- between two existing entities.
+local function on_entity_settings_pasted(event)
+  refresh_recipe_if_changed(event.destination)
+end
+
+-- A blueprint pasted over an existing real entity or entity ghost. NOT
+-- raised for a brand-new entity created by blueprint placement (recipe is
+-- already correct there — building_record() reads it at build time) or for
+-- an instant ghost revive.
+local function on_blueprint_settings_pasted(event)
+  refresh_recipe_if_changed(event.entity)
+end
+
+-- Manual in-game recipe selection has no dedicated event; closing the
+-- machine's own GUI is the only reliable trigger available, so this
+-- re-reads the recipe on every entity-GUI close and relies on
+-- refresh_recipe_if_changed's own diff to no-op when nothing changed.
+local function on_recipe_gui_closed(event)
+  if event.gui_type == defines.gui_type.entity then
+    refresh_recipe_if_changed(event.entity)
+  end
+end
+
 -- Detects an export_enabled+buildings_enabled active -> inactive transition
 -- (either switch going off stops build/destroy events from being recorded)
 -- and, on the inactive -> active transition back, forces a fresh baseline
@@ -1344,6 +1512,8 @@ local function handle_buildings_tracking_transition()
     storage.flma.baseline_in_progress = false
     storage.flma.baseline_chunks = nil
     storage.flma.baseline_entities = nil
+    storage.flma.recipe_entities = {}
+    storage.flma.recipe_rescan_cursor = nil
     helpers.write_file(output_dir() .. "/buildings.ndjson", "", false) -- truncate
   end
   storage.flma.tracking_was_active = now_active
@@ -1366,6 +1536,11 @@ local function reschedule(from_on_load)
   script.on_event(defines.events.on_research_cancelled, nil)
   script.on_event(BUILD_EVENTS, nil)
   script.on_event(DESTROY_EVENTS, nil)
+  script.on_event(defines.events.on_entity_settings_pasted, nil)
+  if defines.events.on_blueprint_settings_pasted then
+    script.on_event(defines.events.on_blueprint_settings_pasted, nil)
+  end
+  script.on_event(defines.events.on_gui_closed, nil)
   script.on_event(defines.events.on_tick, nil)
   script.on_event(defines.events.on_string_translated, nil)
   script.on_event(defines.events.on_player_joined_game, nil)
@@ -1402,6 +1577,9 @@ local function reschedule(from_on_load)
     if inventories_enabled() then
       export_inventories()
     end
+    if buildings_enabled() then
+      rescan_recipes()
+    end
   end)
 
   script.on_event(defines.events.on_research_finished, function(event)
@@ -1433,6 +1611,11 @@ local function reschedule(from_on_load)
     for _, ev in ipairs(DESTROY_EVENTS) do
       script.on_event(ev, on_destroy_event, BUILDING_EVENT_FILTERS)
     end
+    script.on_event(defines.events.on_entity_settings_pasted, on_entity_settings_pasted)
+    if defines.events.on_blueprint_settings_pasted then
+      script.on_event(defines.events.on_blueprint_settings_pasted, on_blueprint_settings_pasted)
+    end
+    script.on_event(defines.events.on_gui_closed, on_recipe_gui_closed)
     if from_on_load then
       -- Never start a new scan from on_load (game/storage writes are
       -- off-limits) — only reattach the drainer if one was already in
@@ -1563,6 +1746,8 @@ remote.add_interface("flma", {
     storage.flma.baseline_in_progress = false
     storage.flma.baseline_chunks = nil
     storage.flma.baseline_entities = nil
+    storage.flma.recipe_entities = {}
+    storage.flma.recipe_rescan_cursor = nil
     helpers.write_file(output_dir() .. "/buildings.ndjson", "", false) -- truncate
     game.print("flma: building index reset; re-scanning under current rules")
     reschedule(false)

@@ -187,13 +187,31 @@ inputs`/`drills` sections back to the user directly.
 production + buffered-stock check, or look at the "already have" annotations
 `plan` prints next to each raw input.
 
-**Before treating a plan's raw inputs as all-new-build.** `plan` also prints
-"existing production" (intermediate items in the chain, not just flattened
-raw inputs) and "existing buildings" (live counts of machine types the plan
-calls for) whenever nonzero — read it and **ask the user** which reuse
-opportunities to apply before recommending new capacity. The tool
+**Before treating a plan's raw inputs as all-new-build.** `plan` prints up to
+three reuse sections whenever nonzero — read them and **ask the user** which
+reuse opportunities to apply before recommending new capacity. The tool
 deliberately doesn't net these out itself (duty cycle, backlog, and whether
-capacity is already spoken for are judgment calls).
+capacity is already spoken for are judgment calls). Read them in this order
+of strength:
+1. **"already producing this exact recipe"** (mod 0.3.5+, needs
+   `flma-export-buildings`) — machines whose live-configured recipe
+   (`buildings.ndjson`'s `recipe` field) matches one this plan would build,
+   for the top-level product or any intermediate stage. This is the
+   strongest signal: it's not just "you own the right machine type", it's
+   "this specific machine is already doing this specific job right now" —
+   lead with this one if it's present.
+2. **"existing production"** — intermediate items in the chain (not just
+   flattened raw_inputs) with nonzero live net production or buffered stock.
+3. **"existing buildings"** — live counts of machine *types* the plan calls
+   for, with no recipe cross-check. Weakest signal: having 5 of the right
+   machine type doesn't mean any of them are free — they could all be
+   configured for something else entirely (check signal 1 first).
+
+**"Which recipe(s) am I already running?"** `producers <item>`/`consumers
+<item>` (mod 0.3.5+, needs `flma-export-buildings`) tag each candidate
+recipe with `[N built]` when at least one currently-placed machine is
+already configured for it — read this before recommending a candidate that
+requires all-new construction when an already-running alternative exists.
 
 **"What's the full ingredient tree, not just the summary?"** Run `expand
 <product> --rate <n>` for the nested BOM instead of `plan`'s flattened

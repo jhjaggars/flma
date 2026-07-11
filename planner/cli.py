@@ -442,6 +442,22 @@ def _collect_intermediate_ids(node: dict, out: set[str]) -> None:
         _collect_intermediate_ids(child, out)
 
 
+def _collect_recipe_selections(node: dict, out: dict[str, str]) -> None:
+    """Walk an `_expand_node` tree collecting {item_id: chosen_recipe_id} for
+    every non-leaf node (the top-level product included). Used to check
+    whether any currently-placed machine is already configured for the exact
+    recipe this plan would build — the strongest possible reuse signal,
+    stronger than merely owning the right machine *type* (see
+    live_state.buildings_by_recipe)."""
+    if node.get("leaf"):
+        return
+    recipe_id = (node.get("recipe") or {}).get("id")
+    if recipe_id:
+        out[node["id"]] = recipe_id
+    for child in node.get("ingredients", []):
+        _collect_recipe_selections(child, out)
+
+
 def _print_tree(
     node: dict,
     indent: int = 0,
@@ -670,7 +686,10 @@ async def cmd_buildings(args: argparse.Namespace) -> int:
             return 0
         print(f"{result['total_matches']} match(es){' (truncated)' if result['truncated'] else ''}")
         for b in result["results"]:
-            print(f"  {b.get('name'):<35} surface={b.get('surface'):<10} pos={b.get('position')}")
+            line = f"  {b.get('name'):<35} surface={b.get('surface'):<10} pos={b.get('position')}"
+            if b.get("recipe"):
+                line += f" recipe={b['recipe']}"
+            print(line)
         return 0
 
     result = observe.building_counts(gs, force=args.force)
@@ -817,16 +836,22 @@ async def _plan_reuse_candidates(
     result: dict,
     net: dict[str, float],
     stock: dict[str, int],
-) -> tuple[list[tuple[str, float | None, int]], list[tuple[str, int, int]]]:
+) -> tuple[
+    list[tuple[str, float | None, int]],
+    list[tuple[str, int, int]],
+    list[tuple[str, str, int]],
+]:
     """Existing production (for intermediate items in the chain, not just
-    the flattened raw_inputs) and existing buildings (live counts of machine
-    types the plan calls for) — reuse candidates to surface before
-    recommending fresh capacity. Empty when live state isn't aligned."""
+    the flattened raw_inputs), existing buildings (live counts of machine
+    types the plan calls for), and existing machines already configured for
+    one of this plan's exact recipes (the strongest reuse signal — see
+    live_state.buildings_by_recipe) — reuse candidates to surface before
+    recommending fresh capacity. All empty when live state isn't aligned."""
     if not align["aligned"]:
-        return [], []
+        return [], [], []
     row, _candidates = await _resolve_item(engine, args.product)
     if row is None:
-        return [], []
+        return [], [], []
     extra_unlocked = await engine.unlocked_recipes_for_techs(scoping.get("assume_researched"))
     stop_set = frozenset(scoping.get("stop_items", []))
     if scoping.get("auto_stop_raw", True):
@@ -865,7 +890,16 @@ async def _plan_reuse_candidates(
         for b in result["buildings"]
         if built.get(b["id"], 0) > 0
     ]
-    return reuse_production, reuse_buildings
+
+    recipe_selections: dict[str, str] = {}
+    _collect_recipe_selections(tree, recipe_selections)
+    configured = live_state.buildings_by_recipe(gs, force=args.force)
+    reuse_recipe_matches = [
+        (item_id, recipe_id, configured[recipe_id])
+        for item_id, recipe_id in sorted(recipe_selections.items())
+        if configured.get(recipe_id, 0) > 0
+    ]
+    return reuse_production, reuse_buildings, reuse_recipe_matches
 
 
 def _print_plan_verbose(
@@ -876,6 +910,7 @@ def _print_plan_verbose(
     stock: dict[str, int],
     reuse_production: list[tuple[str, float | None, int]],
     reuse_buildings: list[tuple[str, int, int]],
+    reuse_recipe_matches: list[tuple[str, str, int]],
     tech_locked_notes: list[str],
 ) -> None:
     per_sec = result["rate_per_min"] / 60.0
@@ -938,6 +973,11 @@ def _print_plan_verbose(
             if s:
                 bits.append(f"{s} buffered")
             print(f"  {iid:<28} {', '.join(bits)}")
+
+    if reuse_recipe_matches:
+        print("\nalready producing this exact recipe (strongest reuse signal):")
+        for item_id, recipe_id, count in reuse_recipe_matches:
+            print(f"  {item_id:<28} {count} machine(s) already set to recipe '{recipe_id}'")
 
     if reuse_buildings:
         print("\nexisting buildings (possible reuse):")
@@ -1007,6 +1047,7 @@ def _print_plan_compact(
     net: dict[str, float],
     reuse_production: list[tuple[str, float | None, int]],
     reuse_buildings: list[tuple[str, int, int]],
+    reuse_recipe_matches: list[tuple[str, str, int]],
     tech_locked_notes: list[str],
 ) -> None:
     """One line per section instead of one line per item — same underlying
@@ -1034,6 +1075,12 @@ def _print_plan_compact(
     if reuse_production:
         prod = ", ".join(f"{iid}({_fmt_num(n or 0)}/min live)" for iid, n, _s in reuse_production)
         print(f"reuse candidates (production): {prod}")
+    if reuse_recipe_matches:
+        recipes = ", ".join(
+            f"{item_id}<-{recipe_id}({count} configured)"
+            for item_id, recipe_id, count in reuse_recipe_matches
+        )
+        print(f"reuse candidates (already producing this exact recipe): {recipes}")
     if reuse_buildings:
         bld = ", ".join(
             f"{name}({have} built/{need} needed)" for name, have, need in reuse_buildings
@@ -1166,18 +1213,33 @@ async def cmd_plan(args: argparse.Namespace) -> int:
     # whether existing capacity actually covers the need (duty cycle,
     # backlog, whether it's earmarked for something else already) stays a
     # human call; this just makes the comparison visible.
-    reuse_production, reuse_buildings = await _plan_reuse_candidates(
+    reuse_production, reuse_buildings, reuse_recipe_matches = await _plan_reuse_candidates(
         engine, args, gs, align, scoping, recipe_overrides, rate_per_min, result, net, stock
     )
     tech_locked_notes = [n for n in result.get("selection_notes", []) if "tech-locked" in n]
 
     if args.full:
         _print_plan_verbose(
-            args, result, align, net, stock, reuse_production, reuse_buildings, tech_locked_notes
+            args,
+            result,
+            align,
+            net,
+            stock,
+            reuse_production,
+            reuse_buildings,
+            reuse_recipe_matches,
+            tech_locked_notes,
         )
     else:
         _print_plan_compact(
-            args, result, align, net, reuse_production, reuse_buildings, tech_locked_notes
+            args,
+            result,
+            align,
+            net,
+            reuse_production,
+            reuse_buildings,
+            reuse_recipe_matches,
+            tech_locked_notes,
         )
     return 0
 
@@ -2151,6 +2213,18 @@ async def _live_extra_unlocked(
     return True, await engine.unlocked_recipes_for_techs(researched)
 
 
+def _configured_recipe_counts(args: argparse.Namespace) -> dict[str, int]:
+    """Currently-placed machine counts by configured recipe (mod 0.3.5+
+    `recipe` field), for annotating `producers`/`consumers` recipe rows with
+    "you already have N machine(s) doing this" — see
+    live_state.buildings_by_recipe. Not gated on modpack alignment like
+    `_live_extra_unlocked`: buildings.ndjson's recipe ids come straight from
+    the live save, so an unaligned recipes.db just correctly shows zero
+    matches rather than needing a separate skip path."""
+    gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
+    return live_state.buildings_by_recipe(gs, force=args.force)
+
+
 async def cmd_producers(args: argparse.Namespace) -> int:
     engine = _make_engine()
     if engine is None:
@@ -2169,6 +2243,7 @@ async def cmd_producers(args: argparse.Namespace) -> int:
         return 1
     aligned, extra_unlocked = await _live_extra_unlocked(engine, args)
     status = await _tech_status_labels(engine, rows, extra_unlocked, aligned)
+    configured = _configured_recipe_counts(args)
     if not aligned:
         print(
             "  (live tech-scoping skipped — recipes.db and live save are different modpacks; see `status`)"
@@ -2187,9 +2262,11 @@ async def cmd_producers(args: argparse.Namespace) -> int:
         # _pick_producer Tier 1.5).
         main = "  [main product]" if r["main_product"] == args.item else ""
         rate = _rate_hint(r["amount"], r["probability"], r["energy"])
+        built = configured.get(r["name"])
+        built_note = f"  [{built} built]" if built else ""
         print(
             f"  {r['name']:<32} ({r['translated_name']})  {amt}x  ({r['category']})"
-            f"{rate}{status.get(r['name'], '')}{main}"
+            f"{rate}{status.get(r['name'], '')}{main}{built_note}"
         )
     return 0
 
@@ -2211,6 +2288,7 @@ async def cmd_consumers(args: argparse.Namespace) -> int:
         return 1
     aligned, extra_unlocked = await _live_extra_unlocked(engine, args)
     status = await _tech_status_labels(engine, rows, extra_unlocked, aligned)
+    configured = _configured_recipe_counts(args)
     if not aligned:
         print(
             "  (live tech-scoping skipped — recipes.db and live save are different modpacks; see `status`)"
@@ -2218,9 +2296,11 @@ async def cmd_consumers(args: argparse.Namespace) -> int:
     item_name = await _item_translated_name(engine, args.item)
     print(f"consumers of {args.item} ({item_name}) ({len(rows)}):")
     for r in rows:
+        built = configured.get(r["name"])
+        built_note = f"  [{built} built]" if built else ""
         print(
             f"  {r['name']:<32} ({r['translated_name']})  {_fmt_num(r['amount'])}x  ({r['category']})"
-            f"{status.get(r['name'], '')}"
+            f"{status.get(r['name'], '')}{built_note}"
         )
     return 0
 

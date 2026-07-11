@@ -7,7 +7,7 @@ live-state reading layer in `src/`, the planner CLI in `planner/`,
 described here; consumers read them and nothing else — there is no other
 channel between the two.
 
-Describes the format as written by mod version **0.3.1** (`mod/info.json`).
+Describes the format as written by mod version **0.3.5** (`mod/info.json`).
 Shape changes are noted in `mod/changelog.txt`; additions of new fields or new
 files are backwards-compatible and consumers must ignore keys they don't
 recognize.
@@ -347,12 +347,15 @@ when `flma-export-buildings` is on. One JSON record per line:
 ```json
 {"t": 20754937, "op": "add", "entity": {"id": 177991, "name": "stone-wall", "type": "wall", "surface": "nauvis", "position": {"x": -741.5, "y": 119.5}, "force": "player"}}
 {"t": 20755100, "op": "remove", "id": 177991}
+{"t": 20755300, "op": "add", "entity": {"id": 178004, "name": "assembling-machine-2", "type": "assembling-machine", "surface": "nauvis", "position": {"x": -700.5, "y": 90.5}, "force": "player", "recipe": "iron-gear-wheel"}}
 ```
 
 - `entity.id` is the entity's `unit_number` — unique per entity for the life
   of the save. Fold the log into a `id → entity` map: `add` upserts,
   `remove` deletes. Re-`add` of a known id just overwrites (this happens:
-  the baseline scan can emit an id the live build handler already wrote).
+  the baseline scan can emit an id the live build handler already wrote, and
+  a recipe change re-emits an `add` for an id already in the map — see
+  `entity.recipe` below).
 - **What counts as a "building"**: any entity *not* in the mod's type
   blocklist (`mod/control.lua` `BUILDING_TYPE_BLOCKLIST`) and not on the
   `enemy`/`neutral` forces. Excluded: non-placed entities (resources, trees,
@@ -362,6 +365,41 @@ when `flma-export-buildings` is on. One JSON record per line:
 - **Baseline scan**: the first time tracking is enabled, the mod emits an
   `add` for every existing building, time-sliced over many ticks (verified:
   a 26k-building base wrote its baseline across ~59 ticks).
+- `entity.recipe` — the machine's currently-configured recipe (internal
+  name, e.g. `"iron-gear-wheel"`). Only present on entities whose `type` is
+  `assembling-machine`, `furnace`, or `rocket-silo` (the only types
+  `LuaEntity.get_recipe()` supports — mod 0.3.5+), and only when a recipe is
+  actually set; **absent, not `null`**, on any other type or on a
+  recipe-capable machine with no recipe configured yet, per this file's
+  general absent-not-null convention.
+
+  A recipe change re-emits an `add` for the same `id` with the new
+  `entity.recipe` (or the field newly absent, if the recipe was cleared) —
+  same upsert semantics as everything else in this file, no new `op`.
+  Coverage of *when* that re-emit happens depends on how the recipe changed:
+
+  | How the recipe changed | Detected by | Latency |
+  |---|---|---|
+  | Machine built/revived with a recipe already set (manual placement, blueprint ghost revive) | Read at build time, same event as the `add` itself | Immediate |
+  | Copy/paste tool (shift-click drag, "paste entity settings" hotkey) between two entities | `on_entity_settings_pasted` | Immediate |
+  | Blueprint pasted over an *existing* entity/ghost | `on_blueprint_settings_pasted` (mod 2.0+; guarded absent-safe if the running Factorio build predates it) | Immediate |
+  | Manual recipe pick from the machine's own GUI | `on_gui_closed` on the entity GUI (no dedicated recipe-change event exists) | Immediate |
+  | Circuit-network "Set recipe" signal (Space Age) | **Not covered by any Factorio event** — the engine only re-evaluates the circuit condition internally when the machine finishes its current craft. Caught only by the periodic bounded rescan below. | Up to one full sweep — with the default `flma-tick-interval` (300 ticks) and the mod's `RECIPE_RESCAN_BATCH_SIZE` (200 entities/cycle), roughly `ceil(recipe_capable_building_count / 200) * 5s` |
+
+  The periodic rescan (`rescan_recipes()` in `mod/control.lua`) re-checks a
+  bounded batch of recipe-capable buildings every `flma-tick-interval`
+  cycle, resuming where the previous cycle left off (Lua's stateless
+  `next()`) rather than re-scanning everything — cost is bounded regardless
+  of base size, same rationale as the baseline scan's chunking. It's the
+  only backstop for circuit-driven changes, but also silently covers any
+  other missed signal, so treat the event-driven paths above as
+  "usually immediate" rather than a hard guarantee.
+
+  **Upgrading an existing save** from a mod version before 0.3.5: buildings
+  already indexed at upgrade time have no cached live entity reference to
+  read a recipe from, so the mod forces one fresh baseline rescan
+  automatically the first time the upgraded mod runs (time-sliced, same as
+  any baseline scan) to backfill `recipe` for everything already placed.
 
 ### Compaction — what a tailing consumer must handle
 

@@ -21,10 +21,16 @@ families the recipe DB has no module-bonus data for at all (see
 rate keeping the worst raw input within a belt budget instead of picking an
 arbitrary rate first, a reuse-before-build report — `plan` cross-references the recipe chain's
 intermediate items and machine types against live production/buffered stock
-and `buildings.ndjson` counts, and prints what already exists so you're
-asked "reuse this?" instead of the tool silently assuming a from-scratch
-build — and `options`/`planner/options.py`, a presentation layer over data
-the engine already computes but every other caller discards:
+and `buildings.ndjson` counts (mod 0.3.5+ additionally cross-references
+`buildings.ndjson`'s per-machine `recipe` field, via
+`live_state.buildings_by_recipe`, to report machines already configured for
+one of the plan's exact recipes — a strictly stronger signal than merely
+owning the right machine type; `producers`/`consumers` tag candidate
+recipes with `[N built]` the same way), and prints what already exists so
+you're asked "reuse this?" instead of the tool silently assuming a
+from-scratch build — and `options`/`planner/options.py`, a presentation
+layer over data the engine already computes but every other caller
+discards:
 `_expand_node`'s `alternates_map` (every candidate recipe per item, tagged
 available/tech_locked/excluded/selected) and `_pick_producer`'s
 `main_product` signal. `options` classifies each candidate as

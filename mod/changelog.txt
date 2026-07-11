@@ -1,4 +1,20 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.5
+Date: 2026-07-11
+  Changes:
+    - buildings.ndjson entries for assembling machines, furnaces, and rocket
+      silos now include entity.recipe (the currently-configured recipe name)
+      when one is set. Tracked via on_entity_settings_pasted (copy/paste
+      tool), on_blueprint_settings_pasted (blueprint over an existing
+      entity), on_gui_closed (manual GUI recipe pick), plus a new bounded
+      periodic rescan (rescan_recipes) that is the only way to catch
+      circuit-network "Set recipe" changes -- Factorio raises no event for
+      those at all. A recipe change re-emits the existing "add" upsert for
+      that id; no new op type. Upgrading an existing save with buildings
+      already tracked triggers one automatic fresh baseline rescan to
+      backfill recipe on already-placed machines. See SCHEMA.md
+      buildings.ndjson for the full per-signal coverage/latency table.
+---------------------------------------------------------------------------------------------------
 Version: 0.3.4
 Date: 2026-07-11
   Changes:

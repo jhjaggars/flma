@@ -109,6 +109,40 @@ For iterating against a live game, use the local dev environment in `../dev/`
 `info.json` requires fully restarting both server and client**, not just a save
 reload.
 
+## `changelog.txt` format
+
+Factorio parses this file with a strict grammar
+([lua-api.factorio.com/latest/auxiliary/changelog-format.html](https://lua-api.factorio.com/latest/auxiliary/changelog-format.html))
+and silently mis-renders (or drops) a section that doesn't match — there's no
+error, just a wrong-looking changelog in the in-game mod manager or on the
+portal. Hard rules, easy to violate by hand-editing:
+
+- Each version section starts with a separator line of **exactly 99 dashes**,
+  nothing else on the line.
+- `Version: X.Y.Z` next (each of X/Y/Z in 0–65535, `0.0.0` invalid), then an
+  optional `Date: ...` line.
+- The line immediately after `Version:`/`Date:` must **not** be blank.
+- A category header (`  Changes:`, `  Bugfixes:`, etc.) is exactly two spaces
+  of indent, then the name, then a colon — nothing after it.
+- An entry is exactly four spaces, a dash, a space, then text; a wrapped
+  continuation line is exactly six spaces of indent, no dash.
+- **No tabs anywhere, no trailing whitespace on any line.**
+
+When adding an entry (required for any change to what the mod exports, see
+above), match the existing entries' exact indentation instead of re-deriving
+it, and don't introduce tabs or trailing spaces. If unsure, verify
+mechanically before committing:
+
+```bash
+python3 -c "
+lines = open('mod/changelog.txt', encoding='utf-8').read().split(chr(10))
+bad = [i+1 for i, l in enumerate(lines) if l != l.rstrip() or '\t' in l]
+print('trailing-whitespace/tab lines:', bad or 'none')
+print('bad separators:', [i+1 for i, l in enumerate(lines)
+      if set(l) == {'-'} and l and l != '-'*99])
+"
+```
+
 ## Packaging
 
 From the repo root: `make mod-zip` → `flma_<version>.zip`; drop into

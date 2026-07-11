@@ -1,6 +1,6 @@
 {
   "name": "flma",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "title": "Factorio Live Agent",
   "author": "jhjaggars",
   "description": "Exports live game state (tech tree, production stats, logistics networks, player inventories, placed buildings, and a RecipeExporter-compatible recipe/prototype dump) as JSON/NDJSON under script-output for a local CLI or AI agent to read. Designed to be near-zero cost when disabled and cheap when enabled: no on_tick polling, engine-aggregated reads over full scans, and an incrementally-maintained building index instead of periodic full scans.",

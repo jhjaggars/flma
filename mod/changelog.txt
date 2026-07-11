@@ -1,4 +1,11 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.4
+Date: 2026-07-11
+  Changes:
+    - Mod portal prep: added thumbnail.png, and fixed title/description in
+      info.json, which still referenced the MCP bridge removed in favor of
+      the planner CLI. No export/runtime behavior changed.
+---------------------------------------------------------------------------------------------------
 Version: 0.3.3
 Date: 2026-07-10
   Changes:

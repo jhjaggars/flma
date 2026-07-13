@@ -85,6 +85,7 @@ addopts = [
 markers = [
     "unit: Unit tests (fast, no external dependencies)",
     "integration: Integration tests (require external services)",
+    "eval: Slow eval tests against a real recipes.db (tests/eval/, excluded from make quick/test)",
 ]
 asyncio_mode = "auto"
 

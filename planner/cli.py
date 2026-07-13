@@ -1,7 +1,7 @@
 """flma factory-planner CLI.
 
-Combines recipe-mcp's calculation engine (machine-count math, recipe
-expansion — see planner/_recipe_mcp_loader.py) with flma's live game state
+Combines the vendored recipe-calculation engine (machine-count math, recipe
+expansion — see planner/recipedb/) with flma's live game state
 (planner/live_state.py) to answer "how do I build a line for X at rate Y,
 and what do I already have toward it" — without an MCP server or Hermes.
 
@@ -41,11 +41,14 @@ import json
 import math
 import sys
 from collections import Counter
+from pathlib import Path
 from types import ModuleType
 
 from planner import config, live_state, module_bonus, observe, techbundle, throughput
-from planner._recipe_mcp_loader import load_async_database_class, load_engine
 from planner.options import classify_producer, deeper_choices, tree_categories, tree_stages
+from planner.recipedb import engine as recipedb_engine
+from planner.recipedb.build_db import build as build_recipes_db
+from planner.recipedb.db import AsyncDatabase
 from planner.recommend import rank_candidates
 
 
@@ -144,20 +147,20 @@ def _parse_recipe_overrides(raw: str | None) -> dict[str, str]:
 
 
 def _make_engine() -> ModuleType | None:
-    """Load recipe-mcp's engine module and point it at our recipes.db.
-    Returns None (after printing an error) if the DB hasn't been built yet."""
+    """Load the vendored recipe-calculation engine and point it at our
+    recipes.db. Returns None (after printing an error) if the DB hasn't been
+    built yet."""
     if not config.RECIPES_DB.exists():
         print(
             f"error: recipes.db not found at {config.RECIPES_DB}\n"
-            f"  build it first: cd {config.RECIPE_MCP_DIR} && make build-db\n"
-            f"  (or set RECIPES_DB / RECIPE_MCP_DIR if the recipe-mcp checkout is elsewhere)",
+            f"  build it first: make build-db  (or: uv run python -m planner build-db)\n"
+            f"  (or set RECIPES_DB, or pass --recipes-json/--recipes-db to build-db, "
+            f"to use a different export)",
             file=sys.stderr,
         )
         return None
-    async_database_cls = load_async_database_class(config.RECIPE_MCP_DIR)
-    engine = load_engine(config.RECIPE_MCP_DIR)
-    engine.set_db(async_database_cls(str(config.RECIPES_DB)))
-    return engine
+    recipedb_engine.set_db(AsyncDatabase(str(config.RECIPES_DB)))
+    return recipedb_engine
 
 
 async def _db_tech_ids(engine: ModuleType) -> set[str]:
@@ -493,6 +496,45 @@ def _print_tree(
 
 
 # ---------------------------------------------------------------------------
+# build-db — build recipes.db from the flma mod's own recipes.json export
+# ---------------------------------------------------------------------------
+
+
+async def cmd_build_db(args: argparse.Namespace) -> int:
+    """Build recipes.db (planner/recipedb) from a recipes.json export.
+
+    Defaults to the live save's own export, resolved the same way every other
+    live-observe command finds it (GameState._resolve_active_dir handles the
+    mod's per-save <save_id> subdirectory) — so this "just works" without the
+    caller needing to know the mod's on-disk layout. --recipes-json overrides
+    the input path (e.g. to build from a foreign/committed dump);
+    --recipes-db overrides the output path (default: RECIPES_DB env var via
+    planner.config, itself defaulting next to SCRIPT_OUTPUT_DIR).
+    """
+    if args.recipes_json:
+        recipes_json = Path(args.recipes_json)
+    else:
+        gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
+        recipes_json = gs.recipes_path
+
+    if not recipes_json.exists():
+        print(
+            f"error: recipes.json not found at {recipes_json}\n"
+            f"  make sure Factorio is running with the flma mod enabled and has\n"
+            f"  exported at least once (see SCHEMA.md's recipes.json section),\n"
+            f"  or pass --recipes-json to point at a different export",
+            file=sys.stderr,
+        )
+        return 1
+
+    recipes_db = Path(args.recipes_db) if args.recipes_db else config.RECIPES_DB
+    print(f"Building {recipes_db}\n  from {recipes_json} ...")
+    build_recipes_db(str(recipes_json), str(recipes_db))
+    print("Done.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # status — modpack/live-data health check; also the no-args default
 # ---------------------------------------------------------------------------
 
@@ -716,7 +758,7 @@ async def cmd_buildings(args: argparse.Namespace) -> int:
 async def _apply_module_bonus_to_buildings(engine: ModuleType, buildings: list[dict]) -> list[dict]:
     """Post-process `plan_product`'s aggregated building counts for the
     module-accelerated families in module_bonus.py. plan_product's own
-    per-category machine selection (recipe-mcp's engine.py, not
+    per-category machine selection (planner/recipedb/engine.py, not
     reimplemented here) uses raw crafting_speed with no module assumption.
     Its building counts are already summed across every recipe step using
     that machine, each step's own math.ceil already applied — recovering the
@@ -755,7 +797,7 @@ async def _apply_module_bonus_to_buildings(engine: ModuleType, buildings: list[d
 def _apply_mining_productivity_to_drills(drills: list[dict], bonus: float) -> list[dict]:
     """Post-process `plan_product`'s drill counts for the live mining-drill
     productivity bonus (planner/live_state.py's
-    mining_drill_productivity_bonus) — recipe-mcp's engine.py (not
+    mining_drill_productivity_bonus) — planner/recipedb/engine.py (not
     reimplemented here) computes drill_count from the raw mining_speed/
     mining_time ratio with no productivity assumption at all (each entry's
     own `note` field says so). A productivity bonus means every mining cycle
@@ -2504,7 +2546,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="planner",
         description=(
-            "flma factory planner — live flma game state x recipe-mcp recipe data\n\n"
+            "flma factory planner — live flma game state x flma's own recipe data\n\n"
             'For an open-ended "how do I make X" question, start with\n'
             "`recommend <product>` — it picks the single best current way to make\n"
             "something. `options`/`producers`/`recipe`/`tech` are for comparing\n"
@@ -2515,6 +2557,16 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command")
+
+    p_build_db = sub.add_parser(
+        "build-db", help="build recipes.db from the flma mod's live recipes.json export"
+    )
+    p_build_db.add_argument(
+        "--recipes-json", help="explicit recipes.json path (default: live save's own export)"
+    )
+    p_build_db.add_argument(
+        "--recipes-db", help="explicit output path (default: RECIPES_DB / planner.config)"
+    )
 
     p_status = sub.add_parser(
         "status", help="modpack/live-data health check (default with no args)"
@@ -2964,6 +3016,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 _HANDLERS = {
+    "build-db": cmd_build_db,
     "status": cmd_status,
     "options": cmd_options,
     "plan": cmd_plan,

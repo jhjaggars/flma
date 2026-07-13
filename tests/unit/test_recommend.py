@@ -4,7 +4,6 @@ live game state (mirrors test_options.py/test_techbundle.py convention)."""
 from __future__ import annotations
 
 import pytest
-
 from planner.recommend import rank_candidates
 
 pytestmark = pytest.mark.unit

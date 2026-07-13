@@ -75,11 +75,14 @@ checkout, since an agent working on/against this repo already has one.
 The live-observe commands above (`research`, `tech-tree`, `production`,
 `logistics`, `inventory`, `buildings`, `status`) work with just the mod
 enabled — no other setup. The factory-planning commands (`plan`, `options`,
-`recommend`, `tech`, …) additionally need a local
-[recipe-mcp](https://github.com/jhjaggars/recipe-mcp) checkout with its
-recipe DB built, regardless of how you installed flma itself — see
-`planner/CLAUDE.md` for why (a filesystem-path import, not a package
-dependency) and the setup steps.
+`recommend`, `tech`, …) additionally need a `recipes.db` built once from the
+mod's own live export — flma vendors the recipe-calculation engine and DB
+builder itself (`planner/recipedb/`, see `planner/CLAUDE.md`), so this is a
+single in-repo step, no other checkout required:
+
+```bash
+make build-db                   # or: uv run python -m planner build-db
+```
 
 **4. Ask questions.**
 
@@ -95,7 +98,7 @@ run by hand:
 
 ```console
 $ flma-planner status
-recipes.db     : /home/jhjaggars/code/recipe-mcp/recipes.db  (312 technologies)
+recipes.db     : /home/jhjaggars/.factorio/script-output/flma/recipes.db  (312 technologies)
 flma live data : /home/jhjaggars/.factorio/script-output/flma
   tech        : 3s ago
   production  : 3s ago
@@ -171,7 +174,7 @@ of all handlers when disabled. Details in [CLAUDE.md](CLAUDE.md).
 | `mod/` | producer | the Factorio mod — self-contained, Lua only |
 | `SCHEMA.md` | contract | exact format of every exported file |
 | `src/` | consumer | shared live-state file-reading layer, used by `planner/` |
-| `planner/` | consumer | the CLI — live-observe commands (`observe.py`) plus the factory-planner (needs a sibling [recipe-mcp](https://github.com/jhjaggars/recipe-mcp) checkout, e.g. `~/code/recipe-mcp`) |
+| `planner/` | consumer | the CLI — live-observe commands (`observe.py`) plus the factory-planner, backed by its own vendored recipe-calculation engine (`recipedb/`, `make build-db` to build `recipes.db`) |
 | `dev/` | mod dev | isolated local server+client environment for developing the mod |
 | `.claude/skills/` | dev | Claude Code skills: `factorio-live` (live-observe commands), `factory-planner`, `factorio-dev` (mod development) |
 

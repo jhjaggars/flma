@@ -1,6 +1,6 @@
 ---
 name: factory-planner
-description: Design Factorio production lines (machine counts, raw inputs, belt counts) using recipe-mcp's calculation engine, cross-referenced against flma's live game state — no MCP server, no Hermes, just a local CLI.
+description: Design Factorio production lines (machine counts, raw inputs, belt counts) using flma's own vendored recipe-calculation engine, cross-referenced against flma's live game state — no MCP server, no Hermes, just a local CLI.
 ---
 
 # flma factory planner
@@ -10,8 +10,8 @@ description: Design Factorio production lines (machine counts, raw inputs, belt 
 Answers "I want to make N/sec of some product — how many machines, what raw
 inputs, how many belts, and what am I already producing toward it?" via a
 local CLI (`planner/`) — no MCP server, no Hermes, no hand-computed
-recipe-chain math (that's baked into `recipe-mcp`'s tested engine, called
-directly).
+recipe-chain math (that's baked into `planner/recipedb/engine.py`'s tested
+engine, called directly).
 
 ## When to use this skill
 
@@ -263,12 +263,12 @@ ungated fallback).
 
 ## Known caveats (don't let these surprise you mid-conversation)
 
-1. **Modpack alignment.** The committed recipe dump defaults to Pyanodons;
-   the live save may run a different modpack. `status` reports whether they
-   match — when they don't, `plan`/`have` still run but tech-scoping/netting
-   are skipped rather than silently wrong. Fix: rebuild the DB from the
-   mod's own live export — `cd $RECIPE_MCP_DIR && uv run python -m
-   src.build_db ~/.factorio/script-output/flma/recipes.json recipes.db`.
+1. **Modpack alignment.** `recipes.db` only matches the live save if it was
+   built from that save's own export. `status` reports whether they match —
+   when they don't, `plan`/`have` still run but tech-scoping/netting are
+   skipped rather than silently wrong. Fix: `make build-db` (or `uv run
+   python -m planner build-db`) — it resolves the live save's own
+   `recipes.json` export automatically, no path-guessing needed.
 2. **Recipe auto-pick can still be a surprising tie.** The picker prefers a
    recipe whose `main_product` is the item you asked for (fixes low-probability
    byproduct recipes winning by alphabetical accident), but when *multiple*
@@ -321,20 +321,19 @@ ungated fallback).
 
 ## Configuration
 
-Two env vars (both optional, sensible defaults):
+One env var, optional with a sensible default:
 
-- `RECIPE_MCP_DIR` — path to the `recipe-mcp` checkout
-  ([github.com/jhjaggars/recipe-mcp](https://github.com/jhjaggars/recipe-mcp)).
-  Default: `~/code/recipe-mcp`.
-- `RECIPES_DB` — path to its built `recipes.db`. Default:
-  `$RECIPE_MCP_DIR/recipes.db`. Not committed to either repo — build it with
-  `cd $RECIPE_MCP_DIR && make build-db` before first use (needs
-  `recipes.json` to already be present there).
+- `RECIPES_DB` — path to the built `recipes.db`. Default:
+  `$SCRIPT_OUTPUT_DIR/recipes.db`. Not committed to the repo — build it with
+  `make build-db` (or `uv run python -m planner build-db`) before first use;
+  it resolves the live save's `recipes.json` export automatically.
+  `--recipes-json`/`--recipes-db` on `planner build-db` override either path.
 
 `SCRIPT_OUTPUT_DIR` (flma's own existing env var) controls where live
-snapshots are read from — shared with the `factorio-live` skill's
-research/production/logistics/inventory/buildings commands.
+snapshots (and, by default, `recipes.db`) are read from — shared with the
+`factorio-live` skill's research/production/logistics/inventory/buildings
+commands.
 
-Debugging internals (import-aliasing trick, where the netting math lives,
-how recipe-mcp's engine is reused) live in `planner/CLAUDE.md`, not here —
-not needed for normal use of this skill.
+Debugging internals (where the vendored engine lives, where the netting math
+lives) live in `planner/CLAUDE.md`, not here — not needed for normal use of
+this skill.

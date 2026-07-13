@@ -45,7 +45,7 @@ routing table.
 | `mod/` | producer | the Factorio mod (Lua): efficiency design rules, mod settings, what files it writes, in-game debugging/verification |
 | `SCHEMA.md` | contract | authoritative format of every exported file — read this before writing or changing any consumer |
 | `src/` | consumer | shared live-state file-reading layer (`game_state.py`): the snapshot/tail file-reading model, consumed by `planner/` |
-| `planner/` | consumer | the CLI: factory-planning commands (recipe-mcp integration, live-state netting, modpack-alignment caveats) and live-observe commands (`observe.py`) reading `src/game_state.py` directly |
+| `planner/` | consumer | the CLI: factory-planning commands (`recipedb/` vendors the recipe-calculation engine, live-state netting, modpack-alignment caveats) and live-observe commands (`observe.py`) reading `src/game_state.py` directly |
 | `dev/` | tooling | isolated local server+client for developing the mod; RCON access (guide: `.claude/skills/factorio-dev/SKILL.md`) |
 | `tests/` | tests | pytest suite for the Python side (`make quick` runs it) |
 | `.claude/skills/` | tooling | `factorio-dev` (dev environment workflow), `factory-planner` (planning commands), `factorio-live` (live-observe commands) |
@@ -63,11 +63,10 @@ make mod-zip         # -> flma_<version>.zip; drop into ~/.factorio/mods/
 # (default ~/.factorio/script-output/flma) and query live state:
 SCRIPT_OUTPUT_DIR=~/.factorio/script-output/flma uv run python -m planner research
 
-# Factory planner (see planner/CLAUDE.md) — build its recipe DB once.
-# Preferred source: flma's own live export (guaranteed to match the running
-# save, see SCHEMA.md `recipes.json`); `make build-db` uses recipe-mcp's
-# committed static dump instead.
-cd ~/code/recipe-mcp && \
-  uv run python -m src.build_db ~/.factorio/script-output/flma/recipes.json recipes.db
+# Factory planner (see planner/CLAUDE.md) — build its recipe DB once, from
+# flma's own live export (guaranteed to match the running save, see
+# SCHEMA.md's `recipes.json` section). Resolves the export automatically,
+# including the mod's per-save subdirectory.
+make build-db
 uv run python -m planner status
 ```

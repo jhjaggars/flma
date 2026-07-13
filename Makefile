@@ -1,7 +1,7 @@
 # Makefile for factorio-live-mcp
 # Uses 'uv run' to execute commands in the project environment
 
-.PHONY: help install dev test lint format typecheck clean mod-zip
+.PHONY: help install dev test lint format typecheck clean mod-zip build-db eval
 
 .DEFAULT_GOAL := help
 
@@ -28,6 +28,9 @@ test: ## Run unit tests
 test-cov: ## Run tests with coverage
 	uv run nox -s tests_with_coverage
 
+eval: ## Run the golden recipe-picker regression suite (tests/eval/) against a real recipes.json -- set RECIPES_JSON to override (default: live save's own export)
+	uv run pytest tests/eval/ -v
+
 lint: ## Run linter (ruff)
 	uv run nox -s lint
 
@@ -48,6 +51,9 @@ clean: ## Clean up generated files
 
 trace-ui: ## View agent-eval MLflow traces (tests/agent_eval/mlruns) in the real MLflow UI, via uvx (no project deps added)
 	MLFLOW_ALLOW_FILE_STORE=true uvx --from mlflow mlflow ui --backend-store-uri file:./tests/agent_eval/mlruns --port 5001
+
+build-db: ## Build planner/recipedb's recipes.db from the flma mod's live recipes.json export (see `planner build-db --help` for overrides)
+	uv run python -m planner build-db
 
 mod-zip: ## Zip the flma mod for local install (~/.factorio/mods) or the mod portal
 	@VERSION=$$(python3 -c "import json; print(json.load(open('mod/info.json'))['version'])"); \

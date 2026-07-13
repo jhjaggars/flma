@@ -2,17 +2,20 @@
 
 A local CLI — **no MCP server, no Hermes** — that answers "how do I build a
 production line for X at rate Y, and what am I already producing toward it?"
-by combining this repo's live game state with `recipe-mcp`'s static
-recipe/machine data ([github.com/jhjaggars/recipe-mcp](https://github.com/jhjaggars/recipe-mcp),
-a standalone sibling project — `~/code/recipe-mcp` — its `recipes.json` is a
-dump from the **RecipeExporter** Factorio mod).
+by combining this repo's live game state with `planner/recipedb/`'s static
+recipe/machine data (a `recipes.json` dump the flma mod itself exports, in
+the **RecipeExporter** format — see `../SCHEMA.md`).
 
 The heavy arithmetic (recipe-chain expansion, batches → machine counts,
-raw-input rollup) is **not reimplemented here** — it's recipe-mcp's own
-`engine.plan_product`/`engine._expand_node` (extracted from its MCP-tool
-`server.py` into a plain, FastMCP-independent `engine.py` specifically so
-both the MCP server and this CLI call the identical, already-tested code).
-`planner/` only adds what didn't exist anywhere: live-production netting,
+raw-input rollup) is **not reimplemented here** — it's `planner/recipedb/
+engine.py`'s `plan_product`/`_expand_node`, vendored from
+[recipe-mcp](https://github.com/jhjaggars/recipe-mcp) (a standalone project
+by the same author — its MCP server originally extracted this exact code
+from its own `server.py` into a plain, FastMCP-independent `engine.py`;
+flma now vendors that module directly rather than importing it from a
+sibling checkout at runtime, so this repo is fully self-contained — see
+`planner/recipedb/__init__.py` for provenance). `planner/` only adds what
+didn't exist anywhere: live-production netting,
 buffered-logistics-stock lookup, tech-scoping from the live save, belt/pipe
 count constants (recipes.json has no throughput data at all),
 module-accelerated crafting-speed assumptions for specific building
@@ -81,6 +84,7 @@ still picks one full recipe per item, so a "combo" recommendation's numbers
 further `plan` invocation that gets you the same thing.
 
 ```bash
+uv run python -m planner build-db                         # build recipes.db from the live save's own recipes.json export
 uv run python -m planner status                          # health check (also the no-arg default)
 uv run python -m planner recommend copper-plate           # the single best plan for your tech level -- start here
 uv run python -m planner options copper-plate             # viable ways to make X, before committing to a chain
@@ -106,40 +110,43 @@ skills, since the only consumer has ever been Claude Code. See
 `.claude/skills/factorio-live/SKILL.md` for the workflow guide; every command
 accepts `--json` for machine-readable output.
 
-Config: `RECIPE_MCP_DIR` (default `~/code/recipe-mcp`),
-`RECIPES_DB` (default `$RECIPE_MCP_DIR/recipes.db` — build once via
-`cd $RECIPE_MCP_DIR && make build-db`). Reuses this repo's own
-`SCRIPT_OUTPUT_DIR` for live state.
+Config: `RECIPES_DB` (default `$SCRIPT_OUTPUT_DIR/recipes.db` — build once via
+`make build-db`, or `uv run python -m planner build-db`). Reuses this repo's
+own `SCRIPT_OUTPUT_DIR` for live state.
 
-**Modpack alignment matters — and is now solvable at the source.** The
+**Modpack alignment matters — and is fully solvable in-repo now.** The
 recipe DB only matches the live save if it was built from the same modpack.
-As of mod 0.3.0 the flma mod itself exports a RecipeExporter-compatible
-`recipes.json` from the running game (see `../SCHEMA.md`), so the aligned
-workflow is to build the DB from the live export:
+Since mod 0.3.0 the flma mod itself exports a RecipeExporter-compatible
+`recipes.json` from the running game (see `../SCHEMA.md`); `build-db`
+resolves that live export automatically (it reads the mod's own
+`current-save.json` pointer the same way every other live-observe command
+does, via `live_state.open_game_state(...).recipes_path` — handles the
+per-save `<save_id>` subdirectory mod 0.3.1+ uses, see `src/game_state.py`),
+so the aligned workflow is just:
 
 ```bash
-cd ~/code/recipe-mcp && \
-  uv run python -m src.build_db ~/.factorio/script-output/flma/recipes.json recipes.db
+make build-db
 ```
 
-(or build to a separate path and point `RECIPES_DB` at it). If instead the DB
-comes from a stale/foreign dump (e.g. recipe-mcp's committed Pyanodons
-`recipes.json` while the live save runs Space Age), live tech-scoping and
-production-netting correctly report "no match" rather than silently mixing
+`--recipes-json`/`--recipes-db` (on `planner build-db`) override either path
+— e.g. to build from a foreign/committed dump instead. If the DB comes from
+a stale/foreign export (a different modpack or an old save), `status`'s
+alignment check correctly reports "no match" rather than silently mixing
 data across incompatible games. See `.claude/skills/factory-planner/SKILL.md`
 for the full workflow guide and caveats.
 
 ## Architecture notes (only if something needs debugging)
 
-- `planner/_recipe_mcp_loader.py` imports recipe-mcp's `src/engine.py` under
-  the alias `recipe_mcp_src` (via `importlib`) rather than a normal
-  `import src.engine` — both projects name their package `src`, so a plain
-  import would silently resolve to whichever one Python already cached.
+- `planner/recipedb/` vendors recipe-mcp's `engine.py`/`db.py`/`build_db.py`
+  verbatim (see `planner/recipedb/__init__.py` for provenance) — no external
+  checkout, no `importlib` aliasing trick needed anymore; `planner/cli.py`
+  imports them as ordinary submodules (`from planner.recipedb import
+  engine`).
 - `planner/live_state.py` computes net production (output − input, summed
   across surfaces) and buffered logistics stock — this math doesn't exist
   anywhere else; `planner/observe.py`'s `production_stats` (the `production`
   command) only passes the raw per-surface counts through untouched.
-- `engine.py` in recipe-mcp was extracted from `server.py` specifically so
-  both the MCP server and this CLI call the *same* calculation code — see
-  that repo's `server.py` module docstring and `plan_factory`'s thin-wrapper
-  body for how they stay in sync.
+- `planner/recipedb/engine.py` was originally extracted from recipe-mcp's
+  `server.py` specifically so both its MCP server and this CLI could call the
+  *same* calculation code — `plan_product`/`_expand_node` are that single
+  source of truth; `planner/cli.py` is the only caller now.

@@ -7,22 +7,16 @@ from pathlib import Path
 
 from src.config import SCRIPT_OUTPUT_DIR  # flma's own live-snapshot directory
 
-# The recipe-mcp checkout (github.com/jhjaggars/recipe-mcp, a standalone
-# sibling project). Used to (a) locate its built recipes.db and (b) import
-# its engine.py calculation logic directly (see planner/_recipe_mcp_loader.py).
-# This tool is single-machine, single-user local tooling, so it references
-# that checkout in place rather than vendoring a copy of the recipe data or
-# the engine code — see CLAUDE.md's factory-planner section for the reasoning.
-RECIPE_MCP_DIR: Path = Path(
-    os.environ.get(
-        "RECIPE_MCP_DIR",
-        str(Path.home() / "code" / "recipe-mcp"),
-    )
-)
+# Path to the recipes.db built by `planner build-db` (planner/recipedb/build_db.py,
+# vendored from recipe-mcp) from the flma mod's own recipes.json export. Not
+# committed to the repo — build it locally before using the planner
+# (`uv run python -m planner build-db`, or `make build-db`).
+#
+# Deliberately a flat default next to SCRIPT_OUTPUT_DIR rather than nested
+# under the live save's <save_id> subdirectory the way recipes.json itself is
+# (see src/game_state.py) — one recipes.db, explicitly rebuilt when the
+# modpack/save changes, with `planner status`'s alignment check catching a
+# stale one rather than silently auto-tracking per-save.
+RECIPES_DB: Path = Path(os.environ.get("RECIPES_DB", str(SCRIPT_OUTPUT_DIR / "recipes.db")))
 
-# Path to the recipes.db built by recipe-mcp's `make build-db`
-# (`python -m src.build_db recipes.json recipes.db`, run inside that repo).
-# Not committed to either repo — build it locally before using the planner.
-RECIPES_DB: Path = Path(os.environ.get("RECIPES_DB", str(RECIPE_MCP_DIR / "recipes.db")))
-
-__all__ = ["SCRIPT_OUTPUT_DIR", "RECIPE_MCP_DIR", "RECIPES_DB"]
+__all__ = ["SCRIPT_OUTPUT_DIR", "RECIPES_DB"]

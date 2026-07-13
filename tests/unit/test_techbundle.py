@@ -14,7 +14,6 @@ Hand-solved for target D plate/min: screen=D, crush=D/2, smelt=D/2.
 from __future__ import annotations
 
 import pytest
-
 from planner.techbundle import (
     classify_boundary,
     default_anchor,

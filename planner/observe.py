@@ -265,8 +265,28 @@ def query_buildings(
         )
 
     results = [b for b in buildings if matches(b)]
+    page = results[:limit]
+    contents = gs.get_building_contents()
+    if contents:
+        # Only merge into the page actually being returned, not every match —
+        # contents is keyed by unit_number as a string (JSON object keys are
+        # always strings; buildings.ndjson's own entity.id is a number), and
+        # is only present at all for machines flma-contents-tracked-names
+        # named, so most results simply get no "contents" key (absent, not
+        # null — matches every other opt-in field in these records). Copies
+        # each dict before mutating rather than editing in place: gs.get_
+        # buildings() returns the SAME dict objects BuildingIndex holds
+        # internally, so mutating b directly would leak a stale "contents"
+        # key into the index itself, corrupting every future read.
+        merged = []
+        for b in page:
+            entry = contents.get(str(b.get("id")))
+            if entry is not None:
+                b = {**b, "contents": entry}
+            merged.append(b)
+        page = merged
     return {
-        "results": results[:limit],
+        "results": page,
         "total_matches": len(results),
         "truncated": len(results) > limit,
     }

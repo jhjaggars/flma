@@ -23,7 +23,14 @@ def write_ndjson(path: Path, events: list[dict]) -> None:
     path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
 
 
-def _add_event(entity_id: int, name: str, force: str = "player", recipe: str | None = None) -> dict:
+def _add_event(
+    entity_id: int,
+    name: str,
+    force: str = "player",
+    recipe: str | None = None,
+    modules: list[dict] | None = None,
+    circuit: dict | None = None,
+) -> dict:
     entity = {
         "id": entity_id,
         "name": name,
@@ -34,6 +41,10 @@ def _add_event(entity_id: int, name: str, force: str = "player", recipe: str | N
     }
     if recipe is not None:
         entity["recipe"] = recipe
+    if modules is not None:
+        entity["modules"] = modules
+    if circuit is not None:
+        entity["circuit"] = circuit
     return {"t": entity_id, "op": "add", "entity": entity}
 
 
@@ -204,6 +215,66 @@ class TestBuildingsByRecipe:
     def test_no_buildings_file_returns_empty(self, tmp_path: Path) -> None:
         gs = GameState(tmp_path, min_refresh_interval=0)
         assert live_state.buildings_by_recipe(gs, force="player") == {}
+
+
+class TestCircuitGatedRecipes:
+    def test_recipe_with_enabled_circuit_condition_is_gated(self, tmp_path: Path) -> None:
+        write_ndjson(
+            tmp_path / "buildings.ndjson",
+            [
+                _add_event(
+                    1,
+                    "assembling-machine-2",
+                    recipe="iron-gear-wheel",
+                    circuit={"enabled": True, "read_contents": False},
+                ),
+            ],
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert live_state.circuit_gated_recipes(gs, force="player") == {"iron-gear-wheel"}
+
+    def test_circuit_present_but_disabled_is_not_gated(self, tmp_path: Path) -> None:
+        write_ndjson(
+            tmp_path / "buildings.ndjson",
+            [
+                _add_event(
+                    1,
+                    "assembling-machine-2",
+                    recipe="iron-gear-wheel",
+                    circuit={"enabled": False, "read_contents": True},
+                ),
+            ],
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert live_state.circuit_gated_recipes(gs, force="player") == set()
+
+    def test_no_circuit_field_is_not_gated(self, tmp_path: Path) -> None:
+        write_ndjson(
+            tmp_path / "buildings.ndjson",
+            [_add_event(1, "assembling-machine-2", recipe="iron-gear-wheel")],
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert live_state.circuit_gated_recipes(gs, force="player") == set()
+
+    def test_filters_by_force(self, tmp_path: Path) -> None:
+        write_ndjson(
+            tmp_path / "buildings.ndjson",
+            [
+                _add_event(
+                    1,
+                    "assembling-machine-2",
+                    force="enemy",
+                    recipe="iron-gear-wheel",
+                    circuit={"enabled": True},
+                ),
+            ],
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert live_state.circuit_gated_recipes(gs, force="player") == set()
+
+    def test_no_buildings_file_returns_empty(self, tmp_path: Path) -> None:
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert live_state.circuit_gated_recipes(gs, force="player") == set()
 
 
 class TestMiningDrillProductivityBonus:

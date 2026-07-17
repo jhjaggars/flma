@@ -222,6 +222,26 @@ local function compact_threshold()
   return settings.global["flma-buildings-compact-threshold"].value
 end
 
+-- Raw comma-separated setting value, "" when unset/disabled. Kept separate
+-- from the parsed-set helper below so the on_nth_tick closure can cheaply
+-- check "is this feature on at all" without building the set every cycle
+-- when it's empty.
+local function contents_tracked_names_raw()
+  return settings.global["flma-contents-tracked-names"].value
+end
+
+-- Parses the comma-separated setting into a name -> true set. Called once
+-- per export_building_contents() invocation (only when the raw string is
+-- non-empty), not per-entity — cheap, the list is expected to be short (a
+-- handful of machine names the player is actively watching).
+local function contents_tracked_names_set()
+  local set = {}
+  for name in string.gmatch(contents_tracked_names_raw(), "[^,]+") do
+    set[name] = true
+  end
+  return set
+end
+
 --------------------------------------------------------------------------------
 -- output helpers
 --------------------------------------------------------------------------------
@@ -460,6 +480,56 @@ local function export_inventories()
 end
 
 --------------------------------------------------------------------------------
+-- per-machine contents (ingredients/output + crafting progress) — dynamic
+-- state that changes every craft, so unlike recipe/modules/circuit it does
+-- NOT ride buildings.ndjson's event log (would churn constantly and defeat
+-- compaction). Instead: a periodic full-overwrite snapshot, scoped to an
+-- explicit list of tracked entity names (flma-contents-tracked-names) so
+-- cost is O(#matched machines) — bounded by what the player actually asked
+-- to watch — never O(#all buildings). Reuses storage.flma.recipe_entities
+-- (already cached for the recipe/rescan machinery below) rather than a
+-- second entity cache, since contents only make sense for the same
+-- RECIPE_CAPABLE_TYPES machines.
+--------------------------------------------------------------------------------
+
+-- Ingredient/output inventory slot constants differ by entity type
+-- (confirmed live: same numeric values, different names — furnaces don't
+-- share assembling machines' defines.inventory.* keys). rocket-silo is in
+-- RECIPE_CAPABLE_TYPES but deliberately not covered here (different/more
+-- complex inventory layout, out of scope) — export_building_contents()
+-- silently skips a tracked rocket-silo rather than erroring.
+local CONTENTS_INVENTORY_BY_TYPE = {
+  ["assembling-machine"] = {
+    input = defines.inventory.assembling_machine_input,
+    output = defines.inventory.assembling_machine_output,
+  },
+  ["furnace"] = {
+    input = defines.inventory.furnace_source,
+    output = defines.inventory.furnace_result,
+  },
+}
+
+local function export_building_contents()
+  local tracked = contents_tracked_names_set()
+  local buildings_out = {}
+  for id, entity in pairs(storage.flma.recipe_entities) do
+    if entity.valid and tracked[entity.name] then
+      local slots = CONTENTS_INVENTORY_BY_TYPE[entity.type]
+      if slots then
+        local input_inv = entity.get_inventory(slots.input)
+        local output_inv = entity.get_inventory(slots.output)
+        buildings_out[tostring(id)] = {
+          crafting_progress = entity.crafting_progress,
+          input = input_inv and input_inv.get_contents() or {},
+          output = output_inv and output_inv.get_contents() or {},
+        }
+      end
+    end
+  end
+  write_snapshot("building-contents", { tick = game.tick, buildings = buildings_out })
+end
+
+--------------------------------------------------------------------------------
 -- placed buildings — incremental index. The only O(#entities) operation is the
 -- one-time baseline scan (chunked across ticks); every build/mine afterward is
 -- O(1). storage.flma.buildings mirrors what's on disk so compaction can rewrite
@@ -483,6 +553,61 @@ local function is_building(entity)
     and not FORCE_BLOCKLIST[entity.force.name]
 end
 
+-- entity.get_module_inventory() is NEVER nil (confirmed against a live
+-- 2.0 game, including on a zero-module-slot machine — it returns a valid
+-- zero-length LuaInventory rather than nil), so "no modules" is detected
+-- via is_empty(), not a nil check. Returns an array of {name, quality,
+-- count} (the same inventory-content shape used elsewhere, see SCHEMA.md's
+-- "two item-count shapes"), or nil when there's nothing to report — same
+-- absent-not-null convention as entity.recipe.
+local function read_modules(entity)
+  local mi = entity.get_module_inventory()
+  if not mi or mi.is_empty() then
+    return nil
+  end
+  return mi.get_contents()
+end
+
+-- entity.get_control_behavior() correctly returns nil until something has
+-- actually configured circuit behavior on this entity (confirmed live) —
+-- deliberately NOT using get_or_create_control_behavior(), which mutates
+-- the entity by creating one; that would pollute every recipe-capable
+-- building's state just from reading it.
+--
+-- Furnaces and assembling machines return different control-behavior
+-- types (LuaFurnaceControlBehavior vs. LuaAssemblingMachineControlBehavior,
+-- confirmed live) — furnaces don't have circuit_set_recipe at all (furnaces
+-- can't have their recipe set by circuit signal) and *error*, not return
+-- nil, if you read it, so that field is gated on entity.type.
+--
+-- circuit_condition is always a populated struct once a control behavior
+-- exists (default comparator "<", constant 0, both signals nil) rather
+-- than nil itself, so "condition is configured" means first_signal or
+-- second_signal is actually set, not "condition ~= nil".
+local function read_circuit_config(entity)
+  local cb = entity.get_control_behavior()
+  if not cb then
+    return nil
+  end
+  local circuit = {
+    enabled = cb.circuit_enable_disable,
+    read_contents = cb.circuit_read_contents,
+  }
+  if entity.type == "assembling-machine" then
+    circuit.set_recipe = cb.circuit_set_recipe
+  end
+  local cond = cb.circuit_condition
+  if cond and (cond.first_signal or cond.second_signal) then
+    circuit.condition = {
+      first_signal = cond.first_signal and cond.first_signal.name or nil,
+      comparator = cond.comparator,
+      constant = cond.constant,
+      second_signal = cond.second_signal and cond.second_signal.name or nil,
+    }
+  end
+  return circuit
+end
+
 local function building_record(entity)
   local pos = entity.position
   local rec = {
@@ -498,6 +623,8 @@ local function building_record(entity)
     if recipe then
       rec.recipe = recipe.name
     end
+    rec.modules = read_modules(entity)
+    rec.circuit = read_circuit_config(entity)
   end
   return rec
 end
@@ -586,16 +713,43 @@ local function maybe_compact_buildings()
   end
 end
 
--- Re-reads an already-tracked recipe-capable entity's live recipe and, if it
--- differs from what's indexed, re-emits an "add" — the same upsert used for
--- a live build — so buildings.ndjson picks up the change under the existing
--- fold-into-a-map semantics (see ../SCHEMA.md buildings.ndjson). No new op
--- type needed: record_build() already recomputes the full record (position,
--- force, recipe, …) from the live entity and overwrites the indexed one.
--- Called from three event handlers below and from rescan_recipes(); O(1)
--- per call (one get_recipe() read plus, only on an actual change, one
+-- Deep-equality for the small plain-value tables read_modules()/
+-- read_circuit_config() build (module content arrays, circuit config) —
+-- no metatables or cycles to worry about, so a plain recursive compare is
+-- enough. a == b up front also handles the common nil-vs-nil case (neither
+-- field configured) without recursing.
+local function values_equal(a, b)
+  if a == b then
+    return true
+  end
+  if type(a) ~= "table" or type(b) ~= "table" then
+    return false
+  end
+  for k, v in pairs(a) do
+    if not values_equal(v, b[k]) then
+      return false
+    end
+  end
+  for k in pairs(b) do
+    if a[k] == nil then
+      return false
+    end
+  end
+  return true
+end
+
+-- Re-reads an already-tracked recipe-capable entity's live recipe, modules,
+-- and circuit config, and if any of the three differ from what's indexed,
+-- re-emits an "add" — the same upsert used for a live build — so
+-- buildings.ndjson picks up the change under the existing fold-into-a-map
+-- semantics (see ../SCHEMA.md buildings.ndjson). No new op type needed:
+-- record_build() already recomputes the full record (position, force,
+-- recipe, modules, circuit, …) from the live entity and overwrites the
+-- indexed one. Called from three event handlers below and from
+-- rescan_recipes(); O(1) per call (one get_recipe()/get_module_inventory()/
+-- get_control_behavior() read each, plus, only on an actual change, one
 -- append).
-local function refresh_recipe_if_changed(entity)
+local function refresh_config_if_changed(entity)
   if not entity or not entity.valid or not entity.unit_number then
     return
   end
@@ -604,24 +758,33 @@ local function refresh_recipe_if_changed(entity)
   end
   local existing = storage.flma.buildings[entity.unit_number]
   local recipe = entity.get_recipe()
-  local new_name = recipe and recipe.name or nil
-  local old_name = existing and existing.recipe or nil
-  if new_name ~= old_name then
+  local new_recipe = recipe and recipe.name or nil
+  local old_recipe = existing and existing.recipe or nil
+  local new_modules = read_modules(entity)
+  local old_modules = existing and existing.modules or nil
+  local new_circuit = read_circuit_config(entity)
+  local old_circuit = existing and existing.circuit or nil
+  if new_recipe ~= old_recipe
+      or not values_equal(new_modules, old_modules)
+      or not values_equal(new_circuit, old_circuit) then
     record_build(entity)
     maybe_compact_buildings()
   end
 end
 
 -- Bounded, resumable sweep over every recipe-capable building's live
--- recipe, run once per tick-interval cycle (see reschedule()'s on_nth_tick
--- registration). This is the ONLY signal that catches a circuit-network
--- "Set recipe" change: Factorio raises no event at all for one (the engine
--- only re-evaluates the circuit condition when the machine finishes its
--- current craft, entirely inside the simulation), so the three event
--- handlers below (on_entity_settings_pasted, on_blueprint_settings_pasted,
--- on_gui_closed) are necessary but not sufficient — see ../SCHEMA.md's
--- buildings.ndjson section for the full breakdown of what each signal does
--- and doesn't cover.
+-- recipe/modules/circuit config, run once per tick-interval cycle (see
+-- reschedule()'s on_nth_tick registration). This is the ONLY signal that
+-- catches a circuit-network "Set recipe" change: Factorio raises no event
+-- at all for one (the engine only re-evaluates the circuit condition when
+-- the machine finishes its current craft, entirely inside the simulation)
+-- — and by the same logic, it's also the only backstop for a circuit
+-- condition or wire connection changed via the network itself rather than
+-- a player action. The three event handlers below
+-- (on_entity_settings_pasted, on_blueprint_settings_pasted, on_gui_closed)
+-- are necessary but not sufficient — see ../SCHEMA.md's buildings.ndjson
+-- section for the full breakdown of what each signal does and doesn't
+-- cover.
 --
 -- Uses Lua's stateless `next()` to resume from where the previous cycle
 -- left off rather than re-walking the whole table, so cost is bounded by
@@ -651,7 +814,7 @@ local function rescan_recipes()
     end
     cursor = id
     if entity.valid then
-      refresh_recipe_if_changed(entity)
+      refresh_config_if_changed(entity)
     else
       stale = stale or {}
       stale[#stale + 1] = id
@@ -1460,18 +1623,20 @@ local function on_destroy_event(event)
   maybe_compact_buildings()
 end
 
--- Three of the four ways a placed machine's recipe can change after it's
--- built (the fourth, circuit-network "Set recipe", raises no event at all —
--- see rescan_recipes()). None of these need BUILDING_EVENT_FILTERS: that
--- shape only applies to entity-creation/destruction events, and each
--- handler's cost is bounded by player-action frequency (copy-paste tool
--- use, blueprint pastes, GUI closes), not by base size or tick rate, so
--- there's no scan-cost rule being bent by leaving them unfiltered.
+-- Three of the four ways a placed machine's recipe (or now modules/circuit
+-- config) can change after it's built (the fourth, circuit-network "Set
+-- recipe", raises no event at all — see rescan_recipes()). None of these
+-- need BUILDING_EVENT_FILTERS: that shape only applies to entity-creation/
+-- destruction events, and each handler's cost is bounded by player-action
+-- frequency (copy-paste tool use, blueprint pastes, GUI closes), not by
+-- base size or tick rate, so there's no scan-cost rule being bent by
+-- leaving them unfiltered.
 --
 -- Copy/paste tool (shift-click drag, or the "paste entity settings" hotkey)
--- between two existing entities.
+-- between two existing entities — also carries modules and circuit
+-- condition, not just recipe.
 local function on_entity_settings_pasted(event)
-  refresh_recipe_if_changed(event.destination)
+  refresh_config_if_changed(event.destination)
 end
 
 -- A blueprint pasted over an existing real entity or entity ghost. NOT
@@ -1479,16 +1644,17 @@ end
 -- already correct there — building_record() reads it at build time) or for
 -- an instant ghost revive.
 local function on_blueprint_settings_pasted(event)
-  refresh_recipe_if_changed(event.entity)
+  refresh_config_if_changed(event.entity)
 end
 
--- Manual in-game recipe selection has no dedicated event; closing the
--- machine's own GUI is the only reliable trigger available, so this
--- re-reads the recipe on every entity-GUI close and relies on
--- refresh_recipe_if_changed's own diff to no-op when nothing changed.
+-- Manual in-game recipe/module/circuit-condition changes have no dedicated
+-- event; closing the machine's own GUI is the only reliable trigger
+-- available for any of them, so this re-reads all three on every
+-- entity-GUI close and relies on refresh_config_if_changed's own diff to
+-- no-op when nothing changed.
 local function on_recipe_gui_closed(event)
   if event.gui_type == defines.gui_type.entity then
-    refresh_recipe_if_changed(event.entity)
+    refresh_config_if_changed(event.entity)
   end
 end
 
@@ -1579,6 +1745,9 @@ local function reschedule(from_on_load)
     end
     if buildings_enabled() then
       rescan_recipes()
+      if contents_tracked_names_raw() ~= "" then
+        export_building_contents()
+      end
     end
   end)
 
@@ -1715,7 +1884,7 @@ remote.add_interface("flma", {
       end
     end
     local msg = string.format(
-      "flma: save_id=%s output_dir=%s export_enabled=%s buildings_enabled=%s buildings_initialized=%s tracked_buildings=%d lines_since_compact=%d recipes_dirty=%s translations_done=%s translations_pending=%d",
+      "flma: save_id=%s output_dir=%s export_enabled=%s buildings_enabled=%s buildings_initialized=%s tracked_buildings=%d lines_since_compact=%d recipes_dirty=%s translations_done=%s translations_pending=%d contents_tracked_names=%s",
       tostring(storage.flma and storage.flma.save_id or "(not yet assigned)"),
       output_dir(),
       tostring(export_enabled()),
@@ -1728,7 +1897,8 @@ remote.add_interface("flma", {
       (storage.flma and storage.flma.recipe_translation_pending_count or 0)
         + (storage.flma and storage.flma.recipe_translation_queue
           and (#storage.flma.recipe_translation_queue - storage.flma.recipe_translation_queue_index + 1)
-          or 0)
+          or 0),
+      contents_tracked_names_raw() == "" and "(none)" or contents_tracked_names_raw()
     )
     game.print(msg)
     -- game.print is invisible to an RCON caller (it goes to chat/stdout, not
@@ -1783,7 +1953,7 @@ remote.add_interface("flma", {
   -- dev/RCON workflows can toggle the mod on without a connected client
   -- driving the Mod Settings GUI. Any argument left nil keeps that setting
   -- unchanged.
-  configure = function(export_enabled_value, buildings_enabled_value, inventories_enabled_value)
+  configure = function(export_enabled_value, buildings_enabled_value, inventories_enabled_value, contents_tracked_names_value)
     if export_enabled_value ~= nil then
       settings.global["flma-export-enabled"] = {value = export_enabled_value}
     end
@@ -1792,6 +1962,9 @@ remote.add_interface("flma", {
     end
     if inventories_enabled_value ~= nil then
       settings.global["flma-export-inventories"] = {value = inventories_enabled_value}
+    end
+    if contents_tracked_names_value ~= nil then
+      settings.global["flma-contents-tracked-names"] = {value = contents_tracked_names_value}
     end
     local msg = "flma: configured via remote call"
     game.print(msg)

@@ -54,6 +54,15 @@ rules throughout (see its top-of-file comment for the full rationale):
    research (coalesced via a dirty flag to at most one write per
    tick-interval), translation-pass completion, or an explicit remote call —
    never the periodic schedule.
+6. Per-machine dynamic state (`building-contents.json` — ingredient/output
+   contents, crafting progress) is inherently O(#machines) if read broadly,
+   so it doesn't get its own scan like buildings' baseline: instead it
+   piggybacks on `storage.flma.recipe_entities` (already cached for the
+   recipe/rescan machinery above) and is explicitly scoped by
+   `flma-contents-tracked-names` to just the entity names the player
+   named — cost is O(#matched machines), the same "bound it to what's
+   actually asked for" shape `export_inventories()` already uses for
+   O(#connected players), never O(#all buildings).
 
 ## Settings (Mod settings → Map, or `/c settings.global[...] = {value=...}`)
 
@@ -64,6 +73,7 @@ rules throughout (see its top-of-file comment for the full rationale):
 | `flma-export-inventories` | `false` | Player inventory contents are more sensitive than aggregate stats |
 | `flma-export-buildings` | `false` | Triggers the one-time baseline scan; off by default |
 | `flma-buildings-compact-threshold` | `20000` | Lines appended before `buildings.ndjson` is compacted |
+| `flma-contents-tracked-names` | `""` | Comma-separated exact entity names to export ingredient/output contents + crafting progress for; empty disables `building-contents.json` entirely. Requires `flma-export-buildings` too |
 
 ## Files written (`script-output/flma/<save_id>/`)
 
@@ -89,7 +99,8 @@ clobbering a different save's files. A small fixed-location pointer,
 | `<save_id>/logistics.json` | every `flma-tick-interval` (full overwrite) | per-force logistic networks: contents, robot counts |
 | `<save_id>/inventories.json` | every `flma-tick-interval`, if enabled (full overwrite) | connected players' main inventory contents |
 | `<save_id>/recipes.json` | on init / mod-config change / recipe-affecting research (coalesced) / translation completion / `remote.call("flma","export_recipes")` — never periodic (full overwrite, ~11 MB) | RecipeExporter-compatible dump of recipes, items, fluids, machines/drills/resources/generators, technologies, qualities, groups (player force); `translated_name` filled in best-effort once a connected player's translation pass completes |
-| `<save_id>/buildings.ndjson` | on build/mine events (append), periodically compacted | `{"op":"add"/"remove", "entity":{...}}` event log |
+| `<save_id>/buildings.ndjson` | on build/mine events (append), periodically compacted | `{"op":"add"/"remove", "entity":{...}}` event log — `entity` includes `recipe`/`modules`/`circuit` config, all absent-not-null |
+| `<save_id>/building-contents.json` | every `flma-tick-interval`, only for machines matching `flma-contents-tracked-names` (full overwrite) | per-machine ingredient/output contents + crafting progress — dynamic state, deliberately not part of the event log |
 
 ## Debugging
 

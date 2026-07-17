@@ -711,6 +711,33 @@ async def cmd_inventory(args: argparse.Namespace) -> int:
     return 0
 
 
+def _format_circuit(circuit: dict) -> str:
+    """Compact one-line rendering of buildings.ndjson's entity.circuit
+    (mod 0.3.6+) for the `buildings --list` text view."""
+    parts = []
+    if circuit.get("enabled"):
+        parts.append("enabled")
+    cond = circuit.get("condition")
+    if cond and cond.get("first_signal"):
+        rhs = cond.get("second_signal") or cond.get("constant")
+        parts.append(f"{cond['first_signal']}{cond.get('comparator', '?')}{rhs}")
+    if circuit.get("set_recipe"):
+        parts.append("set_recipe")
+    if circuit.get("read_contents"):
+        parts.append("read_contents")
+    return "[" + ", ".join(parts) + "]"
+
+
+def _format_contents(contents: dict) -> str:
+    """Compact one-line rendering of a building-contents.json entry (mod
+    0.3.6+, merged in by observe.query_buildings) for `buildings --list`."""
+    progress = contents.get("crafting_progress")
+    progress_str = f"{progress * 100:.0f}%" if isinstance(progress, (int, float)) else "?"
+    inp = ", ".join(f"{i['name']} x{i['count']}" for i in contents.get("input") or [])
+    out = ", ".join(f"{i['name']} x{i['count']}" for i in contents.get("output") or [])
+    return f"progress={progress_str} in=[{inp}] out=[{out}]"
+
+
 async def cmd_buildings(args: argparse.Namespace) -> int:
     gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
     listing = bool(args.name or args.type or args.surface or args.list)
@@ -731,7 +758,14 @@ async def cmd_buildings(args: argparse.Namespace) -> int:
             line = f"  {b.get('name'):<35} surface={b.get('surface'):<10} pos={b.get('position')}"
             if b.get("recipe"):
                 line += f" recipe={b['recipe']}"
+            if b.get("modules"):
+                mods = ", ".join(f"{m['name']} x{m['count']}" for m in b["modules"])
+                line += f" modules=[{mods}]"
+            if b.get("circuit"):
+                line += f" circuit={_format_circuit(b['circuit'])}"
             print(line)
+            if b.get("contents"):
+                print(f"      {_format_contents(b['contents'])}")
         return 0
 
     result = observe.building_counts(gs, force=args.force)
@@ -2267,6 +2301,14 @@ def _configured_recipe_counts(args: argparse.Namespace) -> dict[str, int]:
     return live_state.buildings_by_recipe(gs, force=args.force)
 
 
+def _circuit_gated_recipes(args: argparse.Namespace) -> set[str]:
+    """Recipe names where at least one configured machine's `[N built]`
+    count includes one sitting behind a circuit enable/disable condition
+    (mod 0.3.6+) — see live_state.circuit_gated_recipes."""
+    gs = live_state.open_game_state(config.SCRIPT_OUTPUT_DIR)
+    return live_state.circuit_gated_recipes(gs, force=args.force)
+
+
 async def cmd_producers(args: argparse.Namespace) -> int:
     engine = _make_engine()
     if engine is None:
@@ -2286,6 +2328,7 @@ async def cmd_producers(args: argparse.Namespace) -> int:
     aligned, extra_unlocked = await _live_extra_unlocked(engine, args)
     status = await _tech_status_labels(engine, rows, extra_unlocked, aligned)
     configured = _configured_recipe_counts(args)
+    gated = _circuit_gated_recipes(args)
     if not aligned:
         print(
             "  (live tech-scoping skipped — recipes.db and live save are different modpacks; see `status`)"
@@ -2306,6 +2349,8 @@ async def cmd_producers(args: argparse.Namespace) -> int:
         rate = _rate_hint(r["amount"], r["probability"], r["energy"])
         built = configured.get(r["name"])
         built_note = f"  [{built} built]" if built else ""
+        if r["name"] in gated:
+            built_note += "  [circuit-gated]"
         print(
             f"  {r['name']:<32} ({r['translated_name']})  {amt}x  ({r['category']})"
             f"{rate}{status.get(r['name'], '')}{main}{built_note}"
@@ -2331,6 +2376,7 @@ async def cmd_consumers(args: argparse.Namespace) -> int:
     aligned, extra_unlocked = await _live_extra_unlocked(engine, args)
     status = await _tech_status_labels(engine, rows, extra_unlocked, aligned)
     configured = _configured_recipe_counts(args)
+    gated = _circuit_gated_recipes(args)
     if not aligned:
         print(
             "  (live tech-scoping skipped — recipes.db and live save are different modpacks; see `status`)"
@@ -2340,6 +2386,8 @@ async def cmd_consumers(args: argparse.Namespace) -> int:
     for r in rows:
         built = configured.get(r["name"])
         built_note = f"  [{built} built]" if built else ""
+        if r["name"] in gated:
+            built_note += "  [circuit-gated]"
         print(
             f"  {r['name']:<32} ({r['translated_name']})  {_fmt_num(r['amount'])}x  ({r['category']})"
             f"{status.get(r['name'], '')}{built_note}"

@@ -135,6 +135,25 @@ def buildings_by_recipe(gs: GameState, force: str = "player") -> dict[str, int]:
     return counts
 
 
+def circuit_gated_recipes(gs: GameState, force: str = "player") -> set[str]:
+    """Recipe names with at least one configured machine whose circuit
+    enable/disable condition is on (mod 0.3.6+ `circuit.enabled`) — a
+    machine "built for this recipe" that might be sitting idle right now
+    depending on that condition, not a guaranteed-running one the way a
+    plain `buildings_by_recipe` count implies. Used to annotate
+    `producers`/`consumers`' `[N built]` tag with a caveat rather than
+    letting it read as "N machines definitely running this"."""
+    gated: set[str] = set()
+    for b in gs.get_buildings():
+        if b.get("force") != force:
+            continue
+        recipe = b.get("recipe")
+        circuit = b.get("circuit")
+        if recipe is not None and circuit and circuit.get("enabled"):
+            gated.add(recipe)
+    return gated
+
+
 def modpack_alignment(
     gs: GameState, db_tech_ids: set[str], force: str = "player"
 ) -> dict[str, Any]:

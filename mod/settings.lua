@@ -44,4 +44,19 @@ data:extend({
     maximum_value = 1000000,
     order = "e",
   },
+  {
+    type = "string-setting",
+    name = "flma-contents-tracked-names",
+    setting_type = "runtime-global",
+    default_value = "", -- empty = disabled; a comma-separated list of exact
+                         -- entity prototype names (e.g. "prandium-lab-mk01,rc-mk01")
+                         -- is itself the enable signal, scoping
+                         -- building-contents.json's per-tick-interval cost to
+                         -- O(#matched machines) instead of O(#all buildings)
+    allow_blank = true, -- string-setting rejects a blank default_value unless
+                         -- this is set (confirmed live: the mod fails to load
+                         -- entirely otherwise) -- blank is the deliberate
+                         -- "disabled" state here, not an oversight
+    order = "f",
+  },
 })

@@ -270,6 +270,13 @@ class GameState:
         self.inventories = SnapshotFile(data_dir / "inventories.json")
         self.research = SnapshotFile(data_dir / "research.json")
         self.buildings = BuildingIndex(data_dir / "buildings.ndjson")
+        # building-contents.json is a plain full-overwrite snapshot (unlike
+        # buildings.ndjson's event log) — dynamic per-machine state
+        # (ingredient/output contents, crafting progress) scoped by the
+        # mod's flma-contents-tracked-names setting, so it may simply not
+        # exist if that setting is empty; SnapshotFile already handles a
+        # missing file by returning the last-good (here: empty) value.
+        self.building_contents = SnapshotFile(data_dir / "building-contents.json")
         # recipes.json is ~11 MB and only consumed out-of-band (recipe-mcp's
         # build_db, the planner) — deliberately NOT a SnapshotFile. The bridge
         # never parses it; only its mtime is surfaced via snapshot_ages().
@@ -300,6 +307,7 @@ class GameState:
             self.inventories.read()
             self.research.read()
             self.buildings.refresh()
+            self.building_contents.read()
 
     def health_check(self) -> bool:
         with self._lock:
@@ -338,6 +346,17 @@ class GameState:
             self.refresh()
             return self.buildings.all()
 
+    def get_building_contents(self) -> dict[str, Any]:
+        """Per-machine ingredient/output contents + crafting progress, keyed
+        by unit_number (as a string — JSON object keys are always strings).
+        Empty dict when flma-contents-tracked-names is unset or the file
+        hasn't been written yet, same "absent means empty" fallback every
+        other SnapshotFile-backed getter here uses."""
+        with self._lock:
+            self.refresh()
+            buildings_data: dict[str, Any] = self.building_contents.cached.get("buildings", {})
+            return buildings_data
+
     def snapshot_ages(self) -> dict[str, float | None]:
         with self._lock:
             self.refresh()
@@ -348,6 +367,7 @@ class GameState:
                 "inventories": self.inventories.age_seconds(),
                 "research": self.research.age_seconds(),
                 "buildings": self.buildings.age_seconds(),
+                "building_contents": self.building_contents.age_seconds(),
                 "recipes": self._recipes_age(),
             }
 

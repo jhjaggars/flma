@@ -179,6 +179,32 @@ class TestGameState:
         assert len(buildings) == 1
         assert buildings[0]["name"] == "furnace"
 
+    def test_get_building_contents_reads_snapshot(self, tmp_path: Path) -> None:
+        write_json(
+            tmp_path / "building-contents.json",
+            {
+                "tick": 5,
+                "buildings": {
+                    "42": {
+                        "crafting_progress": 0.5,
+                        "input": [{"name": "iron-plate", "quality": "normal", "count": 5}],
+                        "output": [],
+                    }
+                },
+            },
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        contents = gs.get_building_contents()
+        assert contents["42"]["crafting_progress"] == 0.5
+        assert contents["42"]["input"] == [{"name": "iron-plate", "quality": "normal", "count": 5}]
+
+    def test_get_building_contents_empty_when_file_missing(self, tmp_path: Path) -> None:
+        # flma-contents-tracked-names empty (the default) means the mod never
+        # writes this file at all -- same "absent means empty" fallback as
+        # every other SnapshotFile-backed getter, not an error.
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        assert gs.get_building_contents() == {}
+
     def test_health_check_requires_directory(self, tmp_path: Path) -> None:
         gs = GameState(tmp_path / "nope", min_refresh_interval=0)
         assert gs.health_check() is False
@@ -211,6 +237,7 @@ class TestGameState:
             "inventories": None,
             "research": None,
             "buildings": None,
+            "building_contents": None,
             "recipes": None,
         }
 

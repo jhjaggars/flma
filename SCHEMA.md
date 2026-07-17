@@ -7,7 +7,7 @@ live-state reading layer in `src/`, the planner CLI in `planner/`,
 described here; consumers read them and nothing else — there is no other
 channel between the two.
 
-Describes the format as written by mod version **0.3.5** (`mod/info.json`).
+Describes the format as written by mod version **0.3.6** (`mod/info.json`).
 Shape changes are noted in `mod/changelog.txt`; additions of new fields or new
 files are backwards-compatible and consumers must ignore keys they don't
 recognize.
@@ -52,6 +52,7 @@ than continuing to read stale files at the old path.
 | `<save_id>/inventories.json` | full-overwrite JSON | every `flma-tick-interval` ticks, only if `flma-export-inventories` is on |
 | `<save_id>/recipes.json` | full-overwrite JSON | on init, on mod-configuration change, when a finished/reversed research unlocks recipes or changes recipe productivity (coalesced to the next tick-interval), on translation-pass completion, and on `remote.call("flma", "export_recipes")` — never periodic |
 | `<save_id>/buildings.ndjson` | append-only NDJSON event log | on each build/mine event; periodically compacted (see below), only if `flma-export-buildings` is on |
+| `<save_id>/building-contents.json` | full-overwrite JSON | every `flma-tick-interval` ticks, only for machines matching `flma-contents-tracked-names`; not written at all when that setting is empty |
 
 Nothing is written at all unless the `flma-export-enabled` map setting is on
 (`current-save.json` included — a consumer sees no pointer file at all until
@@ -348,6 +349,7 @@ when `flma-export-buildings` is on. One JSON record per line:
 {"t": 20754937, "op": "add", "entity": {"id": 177991, "name": "stone-wall", "type": "wall", "surface": "nauvis", "position": {"x": -741.5, "y": 119.5}, "force": "player"}}
 {"t": 20755100, "op": "remove", "id": 177991}
 {"t": 20755300, "op": "add", "entity": {"id": 178004, "name": "assembling-machine-2", "type": "assembling-machine", "surface": "nauvis", "position": {"x": -700.5, "y": 90.5}, "force": "player", "recipe": "iron-gear-wheel"}}
+{"t": 20755400, "op": "add", "entity": {"id": 178050, "name": "assembling-machine-3", "type": "assembling-machine", "surface": "nauvis", "position": {"x": -690.5, "y": 90.5}, "force": "player", "recipe": "processing-unit", "modules": [{"name": "productivity-module-2", "quality": "normal", "count": 4}], "circuit": {"enabled": true, "read_contents": false, "set_recipe": false, "condition": {"first_signal": "processing-unit", "comparator": "<", "constant": 5000}}}}
 ```
 
 - `entity.id` is the entity's `unit_number` — unique per entity for the life
@@ -401,6 +403,46 @@ when `flma-export-buildings` is on. One JSON record per line:
   automatically the first time the upgraded mod runs (time-sliced, same as
   any baseline scan) to backfill `recipe` for everything already placed.
 
+- `entity.modules` — the machine's installed modules, same shape as
+  `logistics.json`/`inventories.json` `contents` (an array of `{"name",
+  "quality", "count"}`, mod 0.3.6+). Same gating as `entity.recipe` (only
+  `assembling-machine`/`furnace`/`rocket-silo`) plus absent-not-null: a
+  machine with zero module slots or with slots but nothing installed simply
+  has no `modules` key — **not** an empty array. (`get_module_inventory()`
+  itself never returns nothing on a recipe-capable machine, even with zero
+  slots, so this is a deliberate "nothing to report" collapse, not a
+  passthrough of the engine's own nil-ness.)
+- `entity.circuit` — circuit-network automation config, present only once
+  something has actually configured circuit behavior on this entity (mod
+  0.3.6+; absent otherwise, same convention as `recipe`/`modules`):
+  ```json
+  {"enabled": true, "read_contents": false, "set_recipe": false,
+   "condition": {"first_signal": "processing-unit", "comparator": "<", "constant": 5000}}
+  ```
+  - `enabled` — the circuit enable/disable flag (`circuit_enable_disable`).
+  - `condition` — only present when a comparison signal is actually set
+    (`first_signal` or `second_signal` non-nil); a freshly-created,
+    never-configured control behavior has a condition struct with both
+    signals nil, which is treated as "no condition", not emitted.
+    `first_signal`/`second_signal` are the internal signal name (item,
+    fluid, or virtual signal); `constant` is used when `second_signal` is
+    absent.
+  - `set_recipe` — circuit-driven recipe switching (`circuit_set_recipe`).
+    **Only present on `assembling-machine`** — furnaces can't have their
+    recipe set by circuit signal and error (not return nil) if you read
+    this field on one, so it's omitted entirely for furnaces/rocket-silos
+    rather than guessed at.
+  - `read_contents` — whether the machine broadcasts its contents onto the
+    circuit network (`circuit_read_contents`).
+
+  Both `modules` and `circuit` change-detection ride the exact same paths
+  as `entity.recipe` above (same table, same latencies) — a manual module
+  swap or circuit-GUI edit closes the entity GUI just like a manual recipe
+  pick does, and the periodic rescan is the same sole backstop for a
+  circuit-driven change (e.g. a wire/condition edited by another circuit
+  network rather than a player). A change to *any* of recipe/modules/circuit
+  re-emits one `add` with the full current record, not one event per field.
+
 ### Compaction — what a tailing consumer must handle
 
 The mod periodically rewrites the whole file from its in-memory index
@@ -412,6 +454,56 @@ same size or larger — so also fingerprint the file's leading bytes (the
 first record always starts with a fresh `{"t":<tick>,...}`) and treat any
 change as a rewrite. See `src/game_state.py` `BuildingIndex` for the
 reference implementation.
+
+## `building-contents.json`
+
+Per-machine ingredient/output contents and crafting progress — dynamic state
+that changes every craft, unlike `buildings.ndjson`'s config fields
+(`recipe`/`modules`/`circuit`). Deliberately **not** part of the event log
+(would churn on every craft and defeat compaction); instead a periodic
+full-overwrite snapshot, mod 0.3.6+.
+
+Only written when `flma-export-buildings` is on **and**
+`flma-contents-tracked-names` is a non-empty comma-separated list of exact
+entity prototype names (e.g. `"prandium-lab-mk01,rc-mk01"`) — a non-empty
+list is itself the enable signal, no separate boolean setting. This scopes
+the cost to O(#matched machines) per `flma-tick-interval` cycle (the same
+shape `inventories.json`'s O(#connected players) already uses), never
+O(#all buildings) — an empty setting means the file is never written at
+all, and the last-written snapshot is left in place (stale) if tracking is
+later disabled rather than being truncated.
+
+```json
+{
+  "tick": 20860200,
+  "buildings": {
+    "178050": {
+      "crafting_progress": 0.42,
+      "input": [{ "name": "iron-plate", "quality": "normal", "count": 5 }],
+      "output": [{ "name": "processing-unit", "quality": "normal", "count": 2 }]
+    }
+  }
+}
+```
+
+- Keyed by `entity.id` (`unit_number`) **as a string** — JSON object keys
+  are always strings, matching `inventories.json`'s player-name keying.
+  Cross-reference against `buildings.ndjson`'s `entity.id` (a number there)
+  to join contents back to a specific building's recipe/position.
+- `crafting_progress` — `0`-`1`, `LuaEntity.crafting_progress`.
+- `input`/`output` — same `{"name", "quality", "count"}` array shape as
+  everywhere else; empty array (not absent) when the machine's buffer is
+  genuinely empty, since this file's `buildings` map is already scoped to
+  exactly the entities the setting asked for — no absent-not-null
+  collapsing here, unlike `buildings.ndjson`'s config fields.
+- Only covers `assembling-machine` and `furnace` types — `rocket-silo`
+  (also recipe-capable) has a materially different inventory layout and
+  isn't covered; a tracked rocket-silo is silently skipped rather than
+  erroring.
+- Ingredient/output inventory slots differ by entity type under the hood
+  (`defines.inventory.assembling_machine_input`/`_output` vs.
+  `defines.inventory.furnace_source`/`_result`) but the exported shape is
+  identical either way.
 
 ## Console / RCON introspection
 

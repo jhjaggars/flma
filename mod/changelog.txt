@@ -1,4 +1,28 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.6
+Date: 2026-07-17
+  Changes:
+    - buildings.ndjson entries for assembling machines, furnaces, and rocket
+      silos now also include entity.modules (installed module contents, same
+      shape as logistics.json/inventories.json) and entity.circuit (circuit
+      enable/disable flag, condition, set-recipe and read-contents
+      automation flags) when configured. Both ride the same change-detection
+      paths entity.recipe already used (copy/paste, blueprint paste, GUI
+      close, plus the periodic bounded rescan as the sole backstop for
+      circuit-driven changes) -- refresh_recipe_if_changed is now
+      refresh_config_if_changed and diffs all three fields together, still
+      one "add" upsert per change. See SCHEMA.md buildings.ndjson for the
+      full field documentation.
+    - New building-contents.json: per-machine ingredient/output contents and
+      crafting progress, written every flma-tick-interval for machines whose
+      exact name is listed in the new flma-contents-tracked-names setting
+      (comma-separated, empty by default -- the file is never written at
+      all until this is set). Deliberately not part of buildings.ndjson's
+      event log since this is dynamic per-craft state; scoped to named
+      machines so cost is O(#matched machines), never O(#all buildings).
+      Requires flma-export-buildings also on. See SCHEMA.md
+      building-contents.json.
+---------------------------------------------------------------------------------------------------
 Version: 0.3.5
 Date: 2026-07-11
   Changes:

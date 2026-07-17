@@ -406,3 +406,123 @@ class TestBuildingsFunctions:
         result = observe.query_buildings(_gs(tmp_path), limit=99999)
         # no data yet, but limit clamping itself shouldn't raise
         assert result["results"] == []
+
+    def test_query_buildings_passes_through_modules_and_circuit(self, tmp_path: Path) -> None:
+        # Same absent-not-null pass-through as recipe (test above) — modules/
+        # circuit are mod 0.3.6+ fields on the entity record; query_buildings
+        # doesn't need to know about them specifically, just pass them along.
+        gs = _gs(tmp_path)
+        events_path = tmp_path / "buildings.ndjson"
+        events_path.write_text(
+            json.dumps(
+                {
+                    "t": 1,
+                    "op": "add",
+                    "entity": {
+                        "id": 1,
+                        "name": "assembling-machine-3",
+                        "type": "assembling-machine",
+                        "surface": "nauvis",
+                        "force": "player",
+                        "position": {"x": 0, "y": 0},
+                        "recipe": "processing-unit",
+                        "modules": [{"name": "productivity-module-2", "quality": "normal", "count": 4}],
+                        "circuit": {"enabled": True, "condition": {"first_signal": "processing-unit", "comparator": "<", "constant": 5000}},
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        gs.refresh(force=True)
+
+        result = observe.query_buildings(gs, name="assembling-machine-3")
+        assert result["results"][0]["modules"] == [
+            {"name": "productivity-module-2", "quality": "normal", "count": 4}
+        ]
+        assert result["results"][0]["circuit"]["enabled"] is True
+
+    def test_query_buildings_merges_contents_by_id(self, tmp_path: Path) -> None:
+        gs = _gs(tmp_path)
+        events_path = tmp_path / "buildings.ndjson"
+        events_path.write_text(
+            json.dumps(
+                {
+                    "t": 1,
+                    "op": "add",
+                    "entity": {
+                        "id": 42,
+                        "name": "prandium-lab-mk01",
+                        "type": "assembling-machine",
+                        "surface": "nauvis",
+                        "force": "player",
+                        "position": {"x": 0, "y": 0},
+                        "recipe": "caged-cottongut-1",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        write_json(
+            tmp_path / "building-contents.json",
+            {
+                "tick": 5,
+                "buildings": {
+                    "42": {
+                        "crafting_progress": 0.5,
+                        "input": [{"name": "cottongut-pup", "quality": "normal", "count": 3}],
+                        "output": [],
+                    }
+                },
+            },
+        )
+        gs.refresh(force=True)
+
+        result = observe.query_buildings(gs, name="prandium-lab-mk01")
+        assert result["results"][0]["contents"] == {
+            "crafting_progress": 0.5,
+            "input": [{"name": "cottongut-pup", "quality": "normal", "count": 3}],
+            "output": [],
+        }
+        # A machine with no matching contents entry gets no "contents" key at
+        # all (absent, not null) -- re-fetch the raw index and confirm the
+        # merge didn't mutate BuildingIndex's own stored dict (it returns the
+        # SAME objects on every call, not copies -- see observe.query_buildings).
+        assert "contents" not in gs.get_buildings()[0]
+
+    def test_query_buildings_contents_merge_does_not_leak_stale_data(self, tmp_path: Path) -> None:
+        # Regression guard: query_buildings must copy-on-merge, not mutate the
+        # shared entity dict BuildingIndex holds -- otherwise a stale
+        # "contents" value would leak into every future gs.get_buildings()
+        # read forever, even after building-contents.json changes or the
+        # setting is turned off.
+        gs = _gs(tmp_path)
+        events_path = tmp_path / "buildings.ndjson"
+        events_path.write_text(
+            json.dumps(
+                {
+                    "t": 1,
+                    "op": "add",
+                    "entity": {
+                        "id": 42,
+                        "name": "prandium-lab-mk01",
+                        "type": "assembling-machine",
+                        "surface": "nauvis",
+                        "force": "player",
+                        "position": {"x": 0, "y": 0},
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        write_json(
+            tmp_path / "building-contents.json",
+            {"tick": 5, "buildings": {"42": {"crafting_progress": 0.1, "input": [], "output": []}}},
+        )
+        gs.refresh(force=True)
+
+        observe.query_buildings(gs, name="prandium-lab-mk01")
+        raw = gs.get_buildings()
+        assert "contents" not in raw[0]

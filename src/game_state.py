@@ -253,7 +253,16 @@ class GameState:
     def __init__(self, script_output_dir: Path, min_refresh_interval: float = 0.5) -> None:
         self.base_dir = script_output_dir
         self.min_refresh_interval = min_refresh_interval
-        self._last_refresh = 0.0
+        # None, not 0.0 -- time.monotonic()'s epoch is arbitrary (often
+        # system/container uptime, not "process start" or any fixed point),
+        # so comparing against a literal 0.0 is wrong: on a long-uptime
+        # machine monotonic() is always far past min_refresh_interval and
+        # this never bites, but on a freshly-booted CI container it can
+        # still be under min_refresh_interval, making the very first
+        # refresh() wrongly think it just ran and skip reading every
+        # snapshot entirely (caught live: test_refresh_respects_min_interval
+        # failed deterministically in GitHub Actions, never locally).
+        self._last_refresh: float | None = None
         self._lock = threading.RLock()
         # None means "bound directly to base_dir" (no current-save.json seen
         # yet) — matches _read_current_save_id's own "no pointer" return, so
@@ -296,7 +305,11 @@ class GameState:
     def refresh(self, force: bool = False) -> None:
         with self._lock:
             now = time.monotonic()
-            if not force and (now - self._last_refresh) < self.min_refresh_interval:
+            if (
+                not force
+                and self._last_refresh is not None
+                and (now - self._last_refresh) < self.min_refresh_interval
+            ):
                 return
             self._last_refresh = now
             self._resolve_active_dir()

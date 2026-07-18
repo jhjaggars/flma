@@ -227,6 +227,25 @@ class TestGameState:
         gs.refresh(force=True)
         assert gs.get_tech() == {"tick": 2}
 
+    def test_first_refresh_always_reads_even_on_a_low_monotonic_clock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression test: time.monotonic()'s epoch is arbitrary (often
+        # system/container uptime, not "process start"), so the very first
+        # refresh() must not compare "now" against a literal 0.0 last-refresh
+        # sentinel -- on a long-uptime machine monotonic() is always far past
+        # min_refresh_interval so that bug never bites, but on a
+        # freshly-booted CI container monotonic() can itself still be under
+        # min_refresh_interval, which wrongly made the first-ever refresh
+        # think it had just run and skip reading every snapshot. Simulate
+        # that low-uptime environment directly rather than depending on real
+        # system uptime (which is exactly why this bug was invisible in
+        # local dev but deterministic in GitHub Actions).
+        monkeypatch.setattr(time, "monotonic", lambda: 5.0)
+        write_json(tmp_path / "tech.json", {"tick": 1})
+        gs = GameState(tmp_path, min_refresh_interval=60)
+        assert gs.get_tech() == {"tick": 1}
+
     def test_snapshot_ages_reports_none_when_missing(self, tmp_path: Path) -> None:
         gs = GameState(tmp_path, min_refresh_interval=0)
         ages = gs.snapshot_ages()

@@ -1,0 +1,136 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  ci:
+    name: CI gate
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Build, tag release, and publish to the mod portal
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create
+    # Optional hardening: create a GitHub Environment named "mod-portal" in
+    # this repo's Settings -> Environments with yourself as a required
+    # reviewer, and this job will pause for manual approval after CI passes
+    # but before the (irreversible, public) portal upload. With no such
+    # environment configured, this line is a no-op and the job runs
+    # immediately -- safe either way.
+    environment: mod-portal
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve + verify version
+        id: version
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          INFO_VERSION=$(python3 -c "import json; print(json.load(open('mod/info.json'))['version'])")
+          if [ "$TAG_VERSION" != "$INFO_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME (version $TAG_VERSION) does not match mod/info.json version $INFO_VERSION"
+            exit 1
+          fi
+          echo "version=$INFO_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Extract mod/changelog.txt entry for this version
+        id: changelog
+        run: |
+          set -euo pipefail
+          python3 - "${{ steps.version.outputs.version }}" <<'PYEOF'
+          import sys, pathlib
+
+          version = sys.argv[1]
+          text = pathlib.Path("mod/changelog.txt").read_text(encoding="utf-8")
+          blocks = text.split("-" * 99 + "\n")
+
+          target = None
+          for block in blocks:
+              lines = block.split("\n")
+              if lines and lines[0].strip() == f"Version: {version}":
+                  target = lines
+                  break
+          if target is None:
+              sys.exit(f"no changelog.txt entry found for version {version}")
+
+          idx = 1
+          if idx < len(target) and target[idx].startswith("Date:"):
+              idx += 1
+
+          out = []
+          bullet = None
+          for line in target[idx:]:
+              stripped = line.strip()
+              if line.startswith("  ") and not line.startswith("    ") and stripped.endswith(":"):
+                  if bullet:
+                      out.append(bullet)
+                      bullet = None
+                  out.append(f"\n### {stripped[:-1]}\n")
+              elif line.startswith("    - "):
+                  if bullet:
+                      out.append(bullet)
+                  bullet = "- " + line[6:]
+              elif line.startswith("      ") and bullet is not None:
+                  bullet += " " + stripped
+              elif not stripped:
+                  continue
+          if bullet:
+              out.append(bullet)
+
+          pathlib.Path("release-notes.md").write_text("\n".join(out).strip() + "\n", encoding="utf-8")
+          PYEOF
+
+      - name: make mod-zip
+        run: |
+          sudo apt-get update && sudo apt-get install -y zip
+          make mod-zip
+
+      - name: gh release create
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "flma_${{ steps.version.outputs.version }}.zip" \
+            --title "flma ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md
+
+      - name: Init Factorio Mod Portal upload
+        id: init_upload
+        env:
+          FACTORIO_API_KEY: ${{ secrets.FACTORIO_API_KEY }}
+        run: |
+          set -euo pipefail
+          MOD_NAME=$(python3 -c "import json; print(json.load(open('mod/info.json'))['name'])")
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${FACTORIO_API_KEY}" \
+            -F "mod=${MOD_NAME}" \
+            https://mods.factorio.com/api/v2/mods/releases/init_upload \
+            -o init_upload_response.json
+          UPLOAD_URL=$(python3 -c "
+          import json
+          d = json.load(open('init_upload_response.json'))
+          if 'upload_url' not in d:
+              raise SystemExit('init_upload failed: ' + json.dumps(d))
+          print(d['upload_url'])
+          ")
+          echo "upload_url=$UPLOAD_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Upload mod zip to the portal
+        run: |
+          set -euo pipefail
+          curl -sS -X POST \
+            -F "file=@flma_${{ steps.version.outputs.version }}.zip" \
+            "${{ steps.init_upload.outputs.upload_url }}" \
+            -o upload_response.json
+          python3 -c "
+          import json
+          d = json.load(open('upload_response.json'))
+          if not d.get('success'):
+              raise SystemExit('mod portal upload failed: ' + json.dumps(d))
+          print('mod portal upload succeeded')
+          "

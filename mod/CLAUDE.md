@@ -159,6 +159,28 @@ print('bad separators:', [i+1 for i, l in enumerate(lines)
 From the repo root: `make mod-zip` → `flma_<version>.zip`; drop into
 `~/.factorio/mods/` or upload to the mod portal.
 
+## Publishing a release
+
+Use the `mod-release` skill (`.claude/skills/mod-release/SKILL.md`) rather
+than doing this by hand — it bumps `info.json`, adds a correctly-formatted
+`changelog.txt` entry, runs `make quick`, and pushes a `vX.Y.Z` tag.
+Everything after that is automated by `.github/workflows/release.yml`
+(triggered by the tag push): it re-runs `.github/workflows/ci.yml`'s full
+gate (lint, typecheck, tests, `luac -p` syntax check, changelog format
+check), builds the zip, creates the GitHub release (with notes extracted
+straight from the `changelog.txt` entry), and publishes to the Factorio Mod
+Portal via its upload API.
+
+**One-time setup**: the release workflow needs a repo secret,
+`FACTORIO_API_KEY`, generated at https://factorio.com/profile with the
+**"ModPortal: Upload Mods"** scope (not "Publish Mods" — flma is already
+published; this only adds new releases). Add it under this repo's
+Settings → Secrets and variables → Actions. Optional: a GitHub Environment
+named `mod-portal` (Settings → Environments) with a required reviewer adds
+a manual-approval pause before the portal upload — the workflow already
+references this environment name, so it activates the moment the
+environment exists with protection rules, no workflow edit needed.
+
 ## Verifying in-game
 
 Confirmed working against a real running client (mod checksum loads clean, settings

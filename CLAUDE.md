@@ -48,7 +48,7 @@ routing table.
 | `planner/` | consumer | the CLI: factory-planning commands (`recipedb/` vendors the recipe-calculation engine, live-state netting, modpack-alignment caveats) and live-observe commands (`observe.py`) reading `src/game_state.py` directly |
 | `dev/` | tooling | isolated local server+client for developing the mod; RCON access (guide: `.claude/skills/factorio-dev/SKILL.md`) |
 | `tests/` | tests | pytest suite for the Python side (`make quick` runs it) |
-| `.claude/skills/` | tooling | `factorio-dev` (dev environment workflow), `factory-planner` (planning commands), `factorio-live` (live-observe commands) |
+| `.claude/skills/` | tooling | `factorio-dev` (dev environment workflow), `factory-planner` (planning commands), `factorio-live` (live-observe commands), `mod-release` (version bump + changelog + tag; CI/CD in `.github/workflows/` takes it from there) |
 
 ## Development
 

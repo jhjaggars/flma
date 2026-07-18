@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call: {} # lets release.yml invoke this exact same gate before publishing
+
+jobs:
+  validate:
+    name: lint + typecheck + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: make ci (lint + typecheck + tests with coverage)
+        run: uv run nox -s ci
+
+      - name: Check mod/changelog.txt format
+        # mod/CLAUDE.md documents this exact check -- Factorio's changelog
+        # parser silently mis-renders (or drops) a malformed section rather
+        # than erroring, so this is the only thing that catches it before
+        # publish.
+        run: |
+          python3 -c "
+          lines = open('mod/changelog.txt', encoding='utf-8').read().split(chr(10))
+          bad = [i+1 for i, l in enumerate(lines) if l != l.rstrip() or '\t' in l]
+          bad_seps = [i+1 for i, l in enumerate(lines)
+                      if set(l) == {'-'} and l and l != '-'*99]
+          if bad or bad_seps:
+              print('trailing-whitespace/tab lines:', bad or 'none')
+              print('bad separators:', bad_seps or 'none')
+              raise SystemExit(1)
+          print('changelog.txt format OK')
+          "
+
+  lua-syntax:
+    name: Lua syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install lua5.4
+        run: sudo apt-get update && sudo apt-get install -y lua5.4
+
+      - name: luac -p mod/*.lua
+        # Parse-only syntax check -- catches malformed Lua before it ever
+        # reaches a real Factorio load. Deliberately does NOT catch
+        # Factorio-engine-level validation errors (e.g. a setting prototype
+        # rejected at load time) -- those need an actual Factorio process,
+        # out of scope for this check. See mod-release skill's manual
+        # dev-environment verification step for that.
+        run: luac5.4 -p mod/*.lua

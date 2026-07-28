@@ -106,10 +106,71 @@ Two independent layers, since either one alone can fail silently:
    and runs open rather than refusing to start — convenient for local dev against
    `127.0.0.1`, never silent.
 2. **Network-level restriction** (host firewall + the consuming cluster's
-   NetworkPolicy) — this desktop's firewall may already have a broad port range
-   open for other services; don't assume the token is redundant with it, and don't
-   assume the firewall rule alone is sufficient either (an `ipBlock`/rich-rule
-   ordering mistake is exactly the kind of thing that fails open, not closed).
+   NetworkPolicy) — this desktop's firewall already has a broad port range
+   (`1025-65535/tcp`) open for other services (node_exporter, Syncthing, ...), so
+   don't assume the token is redundant with it, and **verify the firewall rule
+   empirically, don't assume it works** — see the gotcha below, which is exactly
+   the kind of mistake that fails open, not closed.
+
+### The firewalld gotcha (verified the hard way)
+
+The naive approach — a separate rich rule per allowed IP (`accept`) plus one bare
+`rule ... port=9110 protocol=tcp drop` for everyone else — **does not work**, and
+fails in the dangerous direction: it blocks *everyone*, including the allowed IPs,
+not just non-allowed ones. Confirmed via `nft list ruleset`: firewalld's nftables
+backend puts all `drop`/`reject` rich rules into a `filter_IN_<zone>_deny` chain
+and all `accept` rules into a separate `filter_IN_<zone>_allow` chain, and **the
+deny chain is evaluated before the allow chain** — so an unconditional drop rule
+(no source match) terminates every packet to that port before any of the specific
+accept rules, or the zone's own blanket `1025-65535/tcp` allow, ever get a chance
+to run.
+
+The fix: express the restriction as a **single deny-chain rule with a negated
+source match**, using an ipset rather than one drop-rule per excluded host (there's
+no way to negate "one of several specific IPs" in a single rich rule otherwise):
+
+```bash
+sudo firewall-cmd --permanent --new-ipset=flma-mcp-allowed --type=hash:ip
+sudo firewall-cmd --permanent --ipset=flma-mcp-allowed --add-entry=<node-ip>   # once per cluster node
+sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source NOT ipset=flma-mcp-allowed port port=9110 protocol=tcp drop'
+sudo firewall-cmd --reload
+```
+
+Traffic from an allowed IP doesn't match the negated condition, falls through the
+(now source-aware) deny chain unmatched, and proceeds to the allow chain where the
+zone's existing blanket rule accepts it as normal. Traffic from anywhere else
+matches the negated deny rule and is dropped before reaching the allow chain at all.
+
+**Verify both directions after any change here** — a passing "blocked from an
+unauthorized host" test alone doesn't prove the rule is *scoped* correctly; the
+first version of this rule blocked EVERYONE and would have "passed" a
+block-only check:
+
+```bash
+# From an ALLOWED source (must succeed) -- a hostNetwork pod on a cluster node
+# reproduces the actual source IP Hermes' traffic will have.
+kubectl run flma-fw-probe --restart=Never --image=curlimages/curl \
+  --overrides='{"spec":{"nodeName":"<node>","hostNetwork":true}}' --command -- \
+  sh -c 'curl -sS -m 5 -o /dev/null -w "HTTP %{http_code}\n" http://<this-host-ip>:9110/healthz'
+kubectl logs flma-fw-probe; kubectl delete pod flma-fw-probe
+
+# From a DISALLOWED source on the LAN (must time out / fail)
+ssh <some-other-lan-host> "timeout 5 curl -sS -o /dev/null -w 'HTTP %{http_code}\n' \
+  http://<this-host-ip>:9110/healthz || echo unreachable"
+```
+
+### A second gotcha, in the MCP library itself
+
+`FastMCP(...)` auto-enables Host-header ("DNS rebinding") protection allowing ONLY
+`127.0.0.1`/`localhost`/`::1` whenever it's constructed with `host` left at its own
+default (`"127.0.0.1"`) — completely independent of whatever address `uvicorn.run()`
+is later told to actually bind. `server.py` passes `host=config.HOST` into the
+`FastMCP(...)` constructor specifically to avoid this; removing that (e.g. "cleaning
+up" what looks like a redundant kwarg) silently makes every real request 421
+"Invalid Host header" once bound to anything but loopback — caught by testing
+against the real bind address, not just `127.0.0.1`, exactly why that's called out
+in the verification steps below. See
+`tests/integration/test_mcp_server_transport_security.py` for the regression test.
 
 ## Homelab-side wiring (separate repo)
 

@@ -53,7 +53,7 @@ routing table.
 | `SCHEMA.md` | contract | authoritative format of every exported file — read this before writing or changing any consumer |
 | `src/` | consumer | shared live-state file-reading layer (`game_state.py`): the snapshot/tail file-reading model, consumed by `planner/` |
 | `planner/` | consumer | the CLI: factory-planning commands (`recipedb/` vendors the recipe-calculation engine, live-state netting, modpack-alignment caveats) and live-observe commands (`observe.py`) reading `src/game_state.py` directly |
-| `flma_mcp/` | consumer | MCP server over Streamable HTTP wrapping `planner/`'s CLI + `observe.py` for a remote consumer (Hermes) — auth, staleness envelope, shared live-state across requests; see its own `CLAUDE.md` for the desktop deployment and homelab-side wiring |
+| `flma_mcp/` | consumer | MCP server over Streamable HTTP wrapping `planner/`'s CLI + `observe.py` for a remote consumer (Hermes) — auth, staleness envelope, shared live-state across requests, plus a Prometheus `/metrics` exporter scraped by the homelab cluster; see its own `CLAUDE.md` for the desktop deployment and homelab-side wiring |
 | `dev/` | tooling | isolated local server+client for developing the mod; RCON access (guide: `.claude/skills/factorio-dev/SKILL.md`) |
 | `tests/` | tests | pytest suite for the Python side (`make quick` runs it) |
 | `.claude/skills/` | tooling | `factorio-dev` (dev environment workflow), `factory-planner` (planning commands), `factorio-live` (live-observe commands), `mod-release` (version bump + changelog + tag; CI/CD in `.github/workflows/` takes it from there) |

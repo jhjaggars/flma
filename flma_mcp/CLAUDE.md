@@ -29,7 +29,9 @@ reaches a CLI through Bash") stops holding once the consumer is remote.
 | `cli_bridge.py` | `run_cli(argv)` — routes a real argv list through `planner.cli.build_parser()` + `_HANDLERS`, under stdout/stderr capture and a lock. **Never** builds an `argparse.Namespace` by hand (see its own docstring for why) |
 | `planning_tools.py` | 12 tools wrapping the CLI's text-only planning commands (`plan`/`recommend`/`options`/`expand`/`recipe`/`producers`/`consumers`/`power`/`have`/`belts`/`tech`/`status`) via `cli_bridge`. Deliberately excludes `build-db` |
 | `static_tools.py` | 9 tools ported from the homelab repo's `apps/recipe-mcp` (search/browse/machine/drill lookups + research-path expansion) — see below |
-| `server.py` | `FastMCP` assembly, `/healthz`, the bearer-token middleware, `main()` |
+| `exposition.py` | hand-rolled Prometheus text exposition (0.0.4) writer — HELP/TYPE/label escaping, float spelling, family grouping. Zero flma knowledge, zero dependencies, fully unit-tested under `make quick` |
+| `metrics.py` | `/metrics` collectors over the shared `GameState`; the top-N cardinality cap for per-item production; never raises |
+| `server.py` | `FastMCP` assembly, `/healthz`, `/metrics`, the bearer-token middleware, `main()` |
 
 Every tool result carries a `freshness` envelope (`age_seconds`/`stale`/
 `game_running`/`save_id`/`note`) — see `state.freshness()`. Nothing errors when
@@ -62,6 +64,79 @@ too disruptive in practice, the fallback is re-pointing recipe-mcp's own DB buil
 flma's live export (killing its staleness without losing always-on), not resurrecting
 the stale one as-is.
 
+## Prometheus metrics (`/metrics`)
+
+A Prometheus scrape endpoint alongside `/healthz`, on the same shared `GameState`
+and `state.warm()`/`asyncio.to_thread` pattern every MCP tool uses (see
+`metrics.build_body()`). It turns the mod's ~5s export cadence into scrapeable
+series for the homelab's kube-prometheus-stack (see "Homelab-side wiring" below);
+it does not replace any existing tool or command.
+
+**Metric families** (full list in `metrics.py`'s docstrings): always-on meta
+(`flma_up`, `flma_snapshot_age_seconds{snapshot}`, `flma_save_info{save_id}`,
+`flma_scrape_duration_seconds`, `flma_scrape_errors_total`); game data emitted only
+while `flma_up == 1` (research progress/queue, technology counts by status,
+logistic/construction robot counts, building counts by name/type, and capped
+per-item/per-fluid production).
+
+**The produced/consumed naming caveat — the one thing to get right when touching
+this code.** Factorio's `production.json` calls what a force *produced*
+`input_counts` and what it *consumed* `output_counts` (`LuaFlowStatistics`'
+naming, matching the in-game GUI's left/right split — see `SCHEMA.md` and
+`planner/live_state.py`'s `net_production` docstring). The metrics here are named
+`flma_items_produced_total`/`flma_items_consumed_total` — **never** carry
+`input`/`output` into a metric name, that would be faithful to the JSON and a lie
+to anyone reading a dashboard. `tests/unit/test_mcp_metrics.py`'s
+`test_input_counts_map_to_produced_not_consumed` is the regression test that
+catches a future refactor silently flipping this.
+
+**`flma_up` vs Prometheus' own `up{job="flma"}`** — two different signals, both
+needed:
+
+| `up{job="flma"}` | `flma_up` | Meaning | Alert? |
+|---|---|---|---|
+| 0 | (absent) | Desktop off, unit down, or network/firewall broken | Yes — but this is *normal* when the desktop sleeps |
+| 1 | 0 | Server reachable, Factorio not running or export disabled | **Never** |
+| 1 | 1 | Everything live | — |
+
+**Staleness: game-data series are dropped entirely, not frozen at their last
+value**, once the export goes stale (`flma_up` flips to 0). A frozen
+`flma_items_produced_per_minute` while Factorio is closed would be a false
+statement, and worse, indistinguishable on a graph from a factory running
+perfectly steady. **Never write an `absent()`-based alert on a production
+series** — it would fire every time you stop playing. All alerting goes through
+`flma_up` and `flma_snapshot_age_seconds`.
+
+**Cardinality cap — the hard rule:** per-item/fluid production series are capped
+to the top `FLMA_MCP_METRICS_TOP_ITEMS` by throughput (default 40, independently
+per force and per kind), plus `FLMA_MCP_METRICS_ITEM_ALLOWLIST`, plus sticky
+retention (`FLMA_MCP_METRICS_TOP_ITEMS_SLACK`) so ids near the cutoff don't flap
+in and out every scrape. **Anything an alert or recording rule references must be
+in the allowlist — top-N membership is not stable enough to alert on.** Measured
+on a real save: ranks 34–52 by throughput sat within ~15 units/min of each other,
+close enough to reorder on ordinary scrape-to-scrape noise.
+`flma_metrics_items_{seen,selected}` tell you whether the cap is actually binding.
+
+**Save-switch caveat:** production counters carry the same labels across a save
+switch but describe a different factory — `_active_save_id` changes live
+(`src/game_state.py`'s `_resolve_active_dir`), and the counter jumps to an
+unrelated value. Usually downward (`rate()` handles it as a reset correctly);
+occasionally upward (one bogus large rate sample). Accepted rather than fixed —
+adding `save_id` to every production series would double their cardinality for
+the overwhelmingly common single-save case. `flma_save_info{save_id}` is how a
+dashboard shows the switch happened.
+
+**Why hand-rolled text exposition instead of `prometheus_client`:** that library
+is an *instrumentation* API (`Gauge`/`Counter` objects that own and mutate their
+own value); flma has nothing to instrument, every number here is read fresh out
+of `GameState` at scrape time, so the correct `prometheus_client` shape would be a
+custom `Collector` — about the same amount of code as `exposition.py` minus its
+~60 lines of rendering. Putting that rendering behind an optional dependency would
+also move it outside `make quick`'s coverage, and escaping/float-spelling is
+exactly the code most prone to silent breakage in a hand-rolled exporter. Don't
+"simplify" this into a `prometheus_client` dependency without re-reading this
+paragraph.
+
 ## Development
 
 ```bash
@@ -69,6 +144,12 @@ uv sync --extra mcp   # only this server needs the `mcp` package; planner/tests 
 make run-mcp          # foreground, binds 127.0.0.1:9110 by default
 
 curl -s localhost:9110/healthz | python3 -m json.tool
+curl -s localhost:9110/metrics | head -40
+
+# Validate the exposition format (promtool isn't installed on this desktop):
+curl -s localhost:9110/metrics > /tmp/flma.prom
+podman run --rm -i -v /tmp/flma.prom:/m.prom:z --entrypoint promtool \
+  quay.io/prometheus/prometheus:latest check metrics < /m.prom   # expect no output
 ```
 
 `make quick` must stay green with the `mcp` extra **not** installed — that's the
@@ -101,8 +182,14 @@ lock on every start).
 Two independent layers, since either one alone can fail silently:
 
 1. **Bearer token** (`FLMA_MCP_TOKEN`) — required on every route except `/healthz`
-   (which must stay open so it remains a pure liveness signal, not gated behind the
-   same secret it's meant to help debug). If unset, the server logs a loud warning
+   and `/metrics`. `/healthz` stays open so it remains a pure liveness signal, not
+   gated behind the same secret it's meant to help debug — it leaks no game data.
+   `/metrics` is exempt for a different reason: Prometheus' off-cluster
+   `ScrapeConfig` has no clean way to hold a bearer token, so the firewalld
+   `flma-mcp-allowed` ipset (below) is its actual gate — and unlike `/healthz`,
+   `/metrics` **does** leak real game data (production rates, research progress,
+   building counts), which makes that ipset load-bearing for confidentiality here,
+   not just availability. If the token is unset, the server logs a loud warning
    and runs open rather than refusing to start — convenient for local dev against
    `127.0.0.1`, never silent.
 2. **Network-level restriction** (host firewall + the consuming cluster's
@@ -135,6 +222,12 @@ sudo firewall-cmd --permanent --ipset=flma-mcp-allowed --add-entry=<node-ip>   #
 sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source NOT ipset=flma-mcp-allowed port port=9110 protocol=tcp drop'
 sudo firewall-cmd --reload
 ```
+
+Every k3s node's IP needs an entry here, not just whichever node a particular
+consumer happens to be running on right now: Hermes' pod can be scheduled to any
+node, and the in-cluster Prometheus scraping `/metrics` (see "Homelab-side wiring"
+below) is in the same boat — its egress to this host is SNAT'd to whichever node
+it's currently on, and that pod reschedules independently of Hermes'.
 
 Traffic from an allowed IP doesn't match the negated condition, falls through the
 (now source-aware) deny chain unmatched, and proceeds to the allow chain where the
@@ -181,3 +274,12 @@ this desktop, and the SOPS-encrypted token live under that repo's
 separate checks — from any pod on the node Hermes runs on, and from Hermes' own pod
 specifically — so a routing failure and a NetworkPolicy failure can't be confused
 for each other.
+
+The same off-cluster endpoint is also scraped for Prometheus metrics: a
+`ScrapeConfig` at `clusters/homelab/monitoring/scrape.yml` (job `flma`, a literal
+IP target — see that file's comment on why, the same multi-A-record trap as
+`hermes/networkpolicy.yaml`) feeds the homelab's kube-prometheus-stack, and a
+starter Perses dashboard lives at
+`clusters/homelab/perses/dashboards/flma-factory.json`. See this file's
+"Prometheus metrics" section above for `flma_up` semantics, the staleness/
+cardinality rules, and why "Factorio isn't running" must never page.

@@ -26,7 +26,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 
-from flma_mcp import config, live_tools, planning_tools, state, static_tools
+from flma_mcp import config, live_tools, metrics, planning_tools, state, static_tools
 
 logger = logging.getLogger("flma_mcp")
 
@@ -74,14 +74,40 @@ async def healthz(request: Request) -> JSONResponse:
     return JSONResponse(payload)
 
 
+# Paths BearerTokenMiddleware exempts from auth. /healthz leaks no game data
+# (see its docstring above); /metrics does -- production rates, research
+# progress, building counts -- so its exemption is a deliberate tradeoff, not
+# an oversight: Prometheus' off-cluster ScrapeConfig has no clean way to hold
+# a bearer token, and the firewalld `flma-mcp-allowed` ipset is the actual
+# gate for both routes (see flma_mcp/CLAUDE.md's security section). That
+# makes the ipset load-bearing for confidentiality here, not just
+# availability.
+_OPEN_PATHS = frozenset({"/healthz", "/metrics"})
+
+
+@mcp.custom_route("/metrics", methods=["GET"])
+async def metrics_route(request: Request) -> PlainTextResponse:
+    """Prometheus scrape endpoint. Auth-exempt for the reason documented at
+    `_OPEN_PATHS` above. `metrics.build_body()` never raises -- each
+    collector traps its own exceptions so a partial scrape still carries
+    `flma_up`, the one series every alert should hang off (see
+    `flma_mcp/metrics.py` and `flma_mcp/CLAUDE.md`)."""
+    body = await metrics.build_body()
+    return PlainTextResponse(body, media_type=metrics.CONTENT_TYPE)
+
+
 class BearerTokenMiddleware(BaseHTTPMiddleware):
     """Requires `Authorization: Bearer <FLMA_MCP_TOKEN>` on every route
-    except /healthz. If FLMA_MCP_TOKEN is unset, runs open -- convenient for
-    local dev against 127.0.0.1, never silent (see the startup warning in
-    main())."""
+    except /healthz and /metrics (see _OPEN_PATHS above). If FLMA_MCP_TOKEN
+    is unset, runs open -- convenient for local dev against 127.0.0.1, never
+    silent (see the startup warning in main())."""
 
     async def dispatch(self, request: Request, call_next):
-        if config.TOKEN is None or request.url.path == "/healthz":
+        # .rstrip("/") so a request to "/metrics/" doesn't 401 before
+        # Starlette's own redirect_slashes gets a chance to 307 it -- that
+        # redirect is produced *inside* the app, downstream of this
+        # middleware, so a bare `==` check would reject it first.
+        if config.TOKEN is None or request.url.path.rstrip("/") in _OPEN_PATHS:
             return await call_next(request)
         expected = f"Bearer {config.TOKEN}"
         if request.headers.get("authorization") != expected:

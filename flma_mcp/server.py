@@ -32,7 +32,16 @@ logger = logging.getLogger("flma_mcp")
 
 _START_TIME = time.monotonic()
 
-mcp = FastMCP("flma", streamable_http_path="/mcp")
+
+# `host`/`port` here matter for ONE thing: FastMCP auto-enables DNS-rebinding
+# Host-header protection, allowing only 127.0.0.1/localhost/::1, whenever
+# `host` is one of those three (its own default is "127.0.0.1", so leaving
+# this unset would silently reject every real request once bound to a LAN
+# address -- exactly what happened in testing: 127.0.0.1 worked, the real
+# bind address got HTTP 421 "Invalid Host header"). The actual bind/listen
+# address is controlled entirely by uvicorn.run() in main() below, since we
+# build the ASGI app ourselves (build_app()) rather than calling mcp.run().
+mcp = FastMCP("flma", host=config.HOST, port=config.PORT, streamable_http_path="/mcp")
 live_tools.register(mcp)
 planning_tools.register(mcp)
 static_tools.register(mcp)

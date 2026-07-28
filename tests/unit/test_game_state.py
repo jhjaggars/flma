@@ -162,6 +162,33 @@ class TestBuildingIndex:
         idx.refresh()  # should not raise
         assert idx.all() == []
 
+    def test_warm_refresh_does_not_re_replay_from_offset_zero(self, tmp_path: Path) -> None:
+        # This is the invariant flma_mcp's shared-GameState design rests on:
+        # a large save's buildings.ndjson can be tens of MB (see SCHEMA.md),
+        # so a long-lived server must be able to call refresh() repeatedly
+        # without paying a full re-parse each time when nothing changed. If
+        # this regresses, `use_shared_game_state`'s whole cost-saving premise
+        # (planner/live_state.py) is false.
+        path = tmp_path / "buildings.ndjson"
+        append_ndjson(
+            path,
+            {"t": 1, "op": "add", "entity": {"id": 1, "name": "a"}},
+            {"t": 2, "op": "add", "entity": {"id": 2, "name": "b"}},
+        )
+        idx = BuildingIndex(path)
+        idx.refresh()
+        assert {b["id"] for b in idx.all()} == {1, 2}
+        offset_after_first_refresh = idx._offset
+        assert offset_after_first_refresh == path.stat().st_size
+
+        # Nothing on disk changed; a second refresh must be a pure no-op --
+        # nothing appended past the file's current size, no compaction
+        # signal -- and must leave the byte offset exactly where it was
+        # rather than resetting to 0 and re-reading everything.
+        idx.refresh()
+        assert idx._offset == offset_after_first_refresh
+        assert {b["id"] for b in idx.all()} == {1, 2}
+
 
 class TestGameState:
     def test_get_tech_returns_snapshot(self, tmp_path: Path) -> None:

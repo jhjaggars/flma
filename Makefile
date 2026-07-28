@@ -1,4 +1,4 @@
-# Makefile for factorio-live-mcp
+# Makefile for flma
 # Uses 'uv run' to execute commands in the project environment
 
 .PHONY: help install dev test lint format typecheck clean mod-zip build-db eval
@@ -6,7 +6,7 @@
 .DEFAULT_GOAL := help
 
 help: ## Show this help message
-	@echo "factorio-live-mcp - Development Commands"
+	@echo "flma - Development Commands"
 	@echo ""
 	@echo "Usage: make [target]"
 	@echo ""
@@ -54,6 +54,9 @@ trace-ui: ## View agent-eval MLflow traces (tests/agent_eval/mlruns) in the real
 
 build-db: ## Build planner/recipedb's recipes.db from the flma mod's live recipes.json export (see `planner build-db --help` for overrides)
 	uv run python -m planner build-db
+
+run-mcp: ## Run the flma MCP server (live game state + factory planner, for Hermes) in the foreground
+	uv run --extra mcp python -m flma_mcp
 
 mod-zip: ## Zip the flma mod for local install (~/.factorio/mods) or the mod portal
 	@VERSION=$$(python3 -c "import json; print(json.load(open('mod/info.json'))['version'])"); \

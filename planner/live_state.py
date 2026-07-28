@@ -16,10 +16,45 @@ from typing import Any
 
 from src.game_state import GameState
 
+_shared: GameState | None = None
+
+
+def use_shared_game_state(gs: GameState) -> None:
+    """Opt in to a process-wide GameState instead of `open_game_state`
+    constructing a fresh one per call. Meant for long-lived callers (the
+    flma_mcp server) that hold one warm GameState across many requests —
+    `producers`/`recommend`/etc. each call `open_game_state` several times
+    per invocation (see cli.py), and a one-shot CLI process paying a cold
+    `buildings.ndjson` replay per call is fine, but a server re-paying it on
+    every tool call is not (a large save's buildings.ndjson can be tens of
+    MB — see SCHEMA.md).
+
+    The CLI never calls this, so `flma-planner`'s behavior and tests are
+    completely unaffected; this is purely an opt-in fast path for a caller
+    that already has a `GameState` alive."""
+    global _shared
+    _shared = gs
+
+
+def reset_shared_game_state() -> None:
+    """Undo `use_shared_game_state`, restoring the default per-call
+    construction in `open_game_state`. Mainly for tests."""
+    global _shared
+    _shared = None
+
 
 def open_game_state(script_output_dir: Path) -> GameState:
     """Construct a GameState and force an immediate read (a one-shot CLI
-    process has no warm cache to rely on)."""
+    process has no warm cache to rely on) -- or, if `use_shared_game_state`
+    has been called, refresh and return that shared instance instead. In the
+    shared case `refresh(force=True)` is still called so callers always see
+    the current save (and pick up a `current-save.json` pointer change), but
+    it's cheap: GameState's own SnapshotFile/BuildingIndex caching means an
+    already-warm refresh is just a handful of `stat()` calls, not a re-parse.
+    """
+    if _shared is not None:
+        _shared.refresh(force=True)
+        return _shared
     gs = GameState(script_output_dir)
     gs.refresh(force=True)
     return gs

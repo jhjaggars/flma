@@ -3,7 +3,7 @@ requires = ["setuptools>=65.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "factorio-live-mcp"
+name = "flma"
 version = "0.1.0"
 description = "Live Factorio game state reading + CLI tooling (factory planner, live-observe commands) for the flma mod"
 requires-python = ">=3.11"
@@ -12,11 +12,23 @@ authors = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+# Only needed to run the MCP server (flma_mcp/) -- the mod, the planner CLI,
+# and the tests all stay stdlib-only without this. `<2` is deliberate: mcp
+# 2.0.0 is a breaking rewrite that removes `mcp.server.fastmcp.FastMCP`
+# entirely (replaced by `mcp.server.mcpserver`), and the one proven-working
+# in-cluster precedent (apps/recipe-mcp in the homelab repo, already serving
+# Hermes) is pinned to and tested against 1.28.1's FastMCP API. Revisit this
+# ceiling deliberately, with its own port of flma_mcp/server.py, not by
+# letting `>=1.12` silently float onto 2.x.
+mcp = ["mcp[cli]>=1.12,<2"]
+
 [project.scripts]
 flma-planner = "planner.cli:main"
+flma-mcp = "flma_mcp.server:main"
 
 [tool.setuptools.packages.find]
-include = ["src*", "planner*"]
+include = ["src*", "planner*", "flma_mcp*"]
 
 [dependency-groups]
 dev = [
@@ -33,7 +45,7 @@ dev = [
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-src = ["src", "planner", "tests"]
+src = ["src", "planner", "flma_mcp", "tests"]
 
 [tool.ruff.lint]
 select = [
@@ -90,7 +102,7 @@ markers = [
 asyncio_mode = "auto"
 
 [tool.coverage.run]
-source = ["src"]
+source = ["src", "flma_mcp"]
 branch = true
 omit = [
     "*/tests/*",

@@ -2,7 +2,9 @@
 
 Exposes **live** Factorio game state — tech tree, production statistics, logistics
 network contents, player inventories, placed buildings — via a local CLI, for an
-agent to query while a game is running.
+agent to query while a game is running. `flma_mcp/` additionally exposes the same
+state (plus the factory planner) to a **remote** agent with no shell on this
+machine, over MCP/Streamable HTTP — see `flma_mcp/CLAUDE.md`.
 
 ## Architecture
 
@@ -22,6 +24,11 @@ Factorio (server + all clients, synced mod)
    |  read by
    v
 python -m planner <command>  -->  Claude / agent (via Bash + the factorio-live skill)
+   |
+   |  also wrapped by
+   v
+flma_mcp  (Streamable HTTP, systemd --user)  -->  remote agent (Hermes) with no
+                                                   shell on this machine
 ```
 
 **Why this shape, not RCON:** RCON needs *hosting* a game (dedicated server, or a
@@ -46,6 +53,7 @@ routing table.
 | `SCHEMA.md` | contract | authoritative format of every exported file — read this before writing or changing any consumer |
 | `src/` | consumer | shared live-state file-reading layer (`game_state.py`): the snapshot/tail file-reading model, consumed by `planner/` |
 | `planner/` | consumer | the CLI: factory-planning commands (`recipedb/` vendors the recipe-calculation engine, live-state netting, modpack-alignment caveats) and live-observe commands (`observe.py`) reading `src/game_state.py` directly |
+| `flma_mcp/` | consumer | MCP server over Streamable HTTP wrapping `planner/`'s CLI + `observe.py` for a remote consumer (Hermes) — auth, staleness envelope, shared live-state across requests; see its own `CLAUDE.md` for the desktop deployment and homelab-side wiring |
 | `dev/` | tooling | isolated local server+client for developing the mod; RCON access (guide: `.claude/skills/factorio-dev/SKILL.md`) |
 | `tests/` | tests | pytest suite for the Python side (`make quick` runs it) |
 | `.claude/skills/` | tooling | `factorio-dev` (dev environment workflow), `factory-planner` (planning commands), `factorio-live` (live-observe commands), `mod-release` (version bump + changelog + tag; CI/CD in `.github/workflows/` takes it from there) |
@@ -69,4 +77,7 @@ SCRIPT_OUTPUT_DIR=~/.factorio/script-output/flma uv run python -m planner resear
 # including the mod's per-save subdirectory.
 make build-db
 uv run python -m planner status
+
+# Expose the same live state (+ the planner) to a remote agent over MCP:
+uv sync --extra mcp && make run-mcp   # see flma_mcp/CLAUDE.md
 ```

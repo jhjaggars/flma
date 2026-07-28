@@ -303,3 +303,60 @@ class TestMiningDrillProductivityBonus:
         )
         gs = GameState(tmp_path, min_refresh_interval=0)
         assert live_state.mining_drill_productivity_bonus(gs, force="enemy") == 0.0
+
+
+class TestSharedGameState:
+    """`use_shared_game_state`/`reset_shared_game_state` are the opt-in fast
+    path a long-lived server (flma_mcp) uses to avoid `open_game_state`
+    constructing (and cold-loading) a fresh GameState on every call. The CLI
+    never opts in, so this must default to today's per-call behavior."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_shared_state(self):
+        # Module-global state -- never let one test's opt-in leak into the
+        # next test, regardless of pass/fail.
+        live_state.reset_shared_game_state()
+        yield
+        live_state.reset_shared_game_state()
+
+    def test_default_behavior_constructs_a_fresh_instance_per_call(self, tmp_path: Path) -> None:
+        first = live_state.open_game_state(tmp_path)
+        second = live_state.open_game_state(tmp_path)
+        assert first is not second
+
+    def test_opting_in_returns_the_same_shared_instance(self, tmp_path: Path) -> None:
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        live_state.use_shared_game_state(gs)
+        first = live_state.open_game_state(tmp_path)
+        second = live_state.open_game_state(tmp_path)
+        assert first is gs
+        assert second is gs
+
+    def test_opting_in_still_refreshes_the_shared_instance(self, tmp_path: Path) -> None:
+        # `open_game_state` must still pick up newly-written data through the
+        # shared instance -- opting in is about not re-constructing the
+        # object, not about freezing it at its first snapshot.
+        write_json(
+            tmp_path / "research.json",
+            {"tick": 1, "forces": {"player": {"current_research": "automation"}}},
+        )
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        live_state.use_shared_game_state(gs)
+        live_state.open_game_state(tmp_path)
+        assert gs.get_research()["forces"]["player"]["current_research"] == "automation"
+
+        write_json(
+            tmp_path / "research.json",
+            {"tick": 2, "forces": {"player": {"current_research": "logistics"}}},
+        )
+        live_state.open_game_state(tmp_path)
+        assert gs.get_research()["forces"]["player"]["current_research"] == "logistics"
+
+    def test_reset_restores_default_per_call_construction(self, tmp_path: Path) -> None:
+        gs = GameState(tmp_path, min_refresh_interval=0)
+        live_state.use_shared_game_state(gs)
+        assert live_state.open_game_state(tmp_path) is gs
+
+        live_state.reset_shared_game_state()
+        after_reset = live_state.open_game_state(tmp_path)
+        assert after_reset is not gs

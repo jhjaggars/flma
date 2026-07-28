@@ -3,7 +3,7 @@
 import nox
 
 PYTHON_VERSION = None  # Use current Python interpreter
-SRC_DIRS = ["src", "planner", "tests"]
+SRC_DIRS = ["src", "planner", "flma_mcp", "tests"]
 
 nox.options.sessions = ["lint", "typecheck", "tests"]
 
@@ -15,8 +15,8 @@ TEST_DEPS = ["pytest", "pytest-asyncio", "pytest-cov"]
 def lint(session):
     """Run code linters (ruff)."""
     session.install("ruff")
-    session.run("ruff", "check", "src/", "planner/", *session.posargs)
-    session.run("ruff", "format", "--check", "src/", "planner/")
+    session.run("ruff", "check", "src/", "planner/", "flma_mcp/", *session.posargs)
+    session.run("ruff", "format", "--check", "src/", "planner/", "flma_mcp/")
     session.log("✓ Linting passed!")
 
 
@@ -24,19 +24,27 @@ def lint(session):
 def format(session):
     """Auto-format code with ruff."""
     session.install("ruff")
-    session.run("ruff", "format", "src/", "planner/", "tests/")
-    session.run("ruff", "check", "--fix", "src/", "planner/", "tests/")
+    session.run("ruff", "format", "src/", "planner/", "flma_mcp/", "tests/")
+    session.run("ruff", "check", "--fix", "src/", "planner/", "flma_mcp/", "tests/")
     session.log("✓ Code formatted!")
 
 
 @nox.session(python=PYTHON_VERSION)
 def typecheck(session):
-    """Run type checking with mypy."""
+    """Run type checking with mypy.
+
+    Deliberately does NOT install the `mcp` extra here -- flma_mcp/ must
+    typecheck (as `Any`-typed, via [tool.mypy] ignore_missing_imports) even
+    in an environment that never installed it, since that's the same
+    guarantee `make quick` gives the rest of the repo: the MCP server is
+    optional, so its typecheck can't require it.
+    """
     session.install("mypy", *MAIN_DEPS)
     session.run(
         "mypy",
         "src/",
         "planner/",
+        "flma_mcp/",
         "--ignore-missing-imports",
         "--no-strict-optional",
         "--warn-unused-ignores",

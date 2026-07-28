@@ -1,10 +1,14 @@
 # planner/ — factory-planner CLI (a consumer)
 
-A local CLI — **no MCP server, no Hermes** — that answers "how do I build a
-production line for X at rate Y, and what am I already producing toward it?"
-by combining this repo's live game state with `planner/recipedb/`'s static
-recipe/machine data (a `recipes.json` dump the flma mod itself exports, in
-the **RecipeExporter** format — see `../SCHEMA.md`).
+A local CLI — this package itself has no MCP server or Hermes wiring — that
+answers "how do I build a production line for X at rate Y, and what am I
+already producing toward it?" by combining this repo's live game state with
+`planner/recipedb/`'s static recipe/machine data (a `recipes.json` dump the
+flma mod itself exports, in the **RecipeExporter** format — see
+`../SCHEMA.md`). A sibling package, `../flma_mcp/`, wraps these same command
+handlers (unmodified — see `flma_mcp/cli_bridge.py`) behind an MCP server for
+a remote consumer (Hermes) that has no shell on this machine; that layer is
+additive and lives entirely outside `planner/`.
 
 The heavy arithmetic (recipe-chain expansion, batches → machine counts,
 raw-input rollup) is **not reimplemented here** — it's `planner/recipedb/
@@ -99,6 +103,14 @@ uv run python -m planner recipe sand-01 sand-02 sand-03    # compare several rec
 uv run python -m planner belts 2                          # N belts -> achievable rate, for `plan --rate`
 ```
 
+`options`/`plan`/`expand`/`recommend`/`producers`/`consumers`/`power`/`recipe`/
+`have` all take one or more ids in a single invocation (e.g. `plan
+filtration-media pure-sand --rate 1`, `have gravel glass active-carbon`) — one
+process, one DB connection, one live-state read cover every id, instead of a
+shell loop paying that setup cost per item. A shared `--rate`/`--recipe`/
+`--force` applies identically to every id; output for each prints in full,
+separated by a `---` line.
+
 **Live-observe commands** (`planner/observe.py`, behind the `research` /
 `tech-tree` / `production` / `logistics` / `inventory` / `buildings`
 subcommands) read the running game's state directly — no recipe-chain math,
@@ -106,9 +118,12 @@ no DB involved. These replaced `src/server.py`'s former MCP tools of the
 same shapes (`get_research_status`, `get_tech_tree`, `get_production_stats`,
 `get_logistics`, `get_player_inventory`, `get_building_counts`/
 `query_buildings`) when the MCP bridge was removed in favor of a single CLI +
-skills, since the only consumer has ever been Claude Code. See
-`.claude/skills/factorio-live/SKILL.md` for the workflow guide; every command
-accepts `--json` for machine-readable output.
+skills, since the only consumer at the time was Claude Code, which reaches a
+CLI through `Bash` as directly as it would MCP tools — `../flma_mcp/`'s
+`live_tools.py` now wraps these same `observe.py` functions again, for the
+one consumer (Hermes) that reasoning doesn't cover: a remote agent with no
+shell here at all. See `.claude/skills/factorio-live/SKILL.md` for the
+workflow guide; every command accepts `--json` for machine-readable output.
 
 Config: `RECIPES_DB` (default `$SCRIPT_OUTPUT_DIR/recipes.db` — build once via
 `make build-db`, or `uv run python -m planner build-db`). Reuses this repo's

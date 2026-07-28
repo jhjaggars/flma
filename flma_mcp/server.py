@@ -1,0 +1,117 @@
+"""flma MCP server: Streamable HTTP at /mcp, plus an open (no-auth) /healthz.
+
+Run via `make run-mcp`, `uv run --extra mcp python -m flma_mcp`, or the
+`flma-mcp` console script (after `uv sync --extra mcp`). See
+flma_mcp/CLAUDE.md for the desktop systemd unit and the homelab-side wiring.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+import time
+
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError:  # pragma: no cover -- exercised by hand, not in CI
+    print(
+        "flma_mcp requires the 'mcp' extra: uv sync --extra mcp\n"
+        "(the flma repo itself stays dependency-free; this is opt-in.)",
+        file=sys.stderr,
+    )
+    raise SystemExit(1) from None
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse
+
+from flma_mcp import config, live_tools, planning_tools, state, static_tools
+
+logger = logging.getLogger("flma_mcp")
+
+_START_TIME = time.monotonic()
+
+mcp = FastMCP("flma", streamable_http_path="/mcp")
+live_tools.register(mcp)
+planning_tools.register(mcp)
+static_tools.register(mcp)
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request: Request) -> JSONResponse:
+    """Liveness + freshness for humans and the in-cluster reachability
+    check (see flma_mcp/CLAUDE.md's verification section) -- deliberately
+    NOT behind the bearer token (BearerTokenMiddleware below exempts this
+    path), so it stays a pure "is this reachable at all" signal that leaks
+    no game data. Returns 503 only when SCRIPT_OUTPUT_DIR itself is
+    missing; "Factorio isn't running right now" is reported in the body
+    (`game_running: false`) rather than as an unhealthy status -- the
+    server is still fully useful for planning off recipes.db in that case,
+    and flapping Restart=on-failure every time the user quits the game
+    would be actively wrong."""
+    gs = state.gs()
+    if not gs.health_check():
+        return JSONResponse(
+            {"status": "error", "reason": f"{gs.base_dir} does not exist"}, status_code=503
+        )
+    await state.warm()
+    status_payload = await asyncio.to_thread(live_tools._status_payload)
+    payload = {
+        "status": "ok",
+        "uptime_seconds": time.monotonic() - _START_TIME,
+        **status_payload,
+    }
+    return JSONResponse(payload)
+
+
+class BearerTokenMiddleware(BaseHTTPMiddleware):
+    """Requires `Authorization: Bearer <FLMA_MCP_TOKEN>` on every route
+    except /healthz. If FLMA_MCP_TOKEN is unset, runs open -- convenient for
+    local dev against 127.0.0.1, never silent (see the startup warning in
+    main())."""
+
+    async def dispatch(self, request: Request, call_next):
+        if config.TOKEN is None or request.url.path == "/healthz":
+            return await call_next(request)
+        expected = f"Bearer {config.TOKEN}"
+        if request.headers.get("authorization") != expected:
+            return PlainTextResponse("unauthorized", status_code=401)
+        return await call_next(request)
+
+
+def build_app():
+    app = mcp.streamable_http_app()
+    app.add_middleware(BearerTokenMiddleware)
+    return app
+
+
+def main() -> int:
+    logging.basicConfig(
+        level=config.LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
+
+    if config.TOKEN is None:
+        logger.warning(
+            "FLMA_MCP_TOKEN is not set -- running WITHOUT authentication. "
+            "Every tool call and /healthz will be answered to anyone who can "
+            "reach %s:%s. Set FLMA_MCP_TOKEN before exposing this beyond "
+            "127.0.0.1.",
+            config.HOST,
+            config.PORT,
+        )
+
+    logger.info("loading initial game state from %s", config.SCRIPT_OUTPUT_DIR)
+    state.init()
+
+    import uvicorn
+
+    tool_count = len(asyncio.run(mcp.list_tools()))
+    logger.info("starting flma-mcp on %s:%s (tools: %d)", config.HOST, config.PORT, tool_count)
+
+    uvicorn.run(build_app(), host=config.HOST, port=config.PORT, log_level=config.LOG_LEVEL.lower())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

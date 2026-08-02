@@ -496,8 +496,9 @@ end
 -- (confirmed live: same numeric values, different names — furnaces don't
 -- share assembling machines' defines.inventory.* keys). rocket-silo is in
 -- RECIPE_CAPABLE_TYPES but deliberately not covered here (different/more
--- complex inventory layout, out of scope) — export_building_contents()
--- silently skips a tracked rocket-silo rather than erroring.
+-- complex inventory layout, out of scope) — a tracked rocket-silo gets no
+-- input/output (empty arrays) rather than erroring, but still gets fluids
+-- below, which aren't gated by this table.
 local CONTENTS_INVENTORY_BY_TYPE = {
   ["assembling-machine"] = {
     input = defines.inventory.assembling_machine_input,
@@ -515,15 +516,38 @@ local function export_building_contents()
   for id, entity in pairs(storage.flma.recipe_entities) do
     if entity.valid and tracked[entity.name] then
       local slots = CONTENTS_INVENTORY_BY_TYPE[entity.type]
+      local input_contents, output_contents = {}, {}
       if slots then
         local input_inv = entity.get_inventory(slots.input)
         local output_inv = entity.get_inventory(slots.output)
-        buildings_out[tostring(id)] = {
-          crafting_progress = entity.crafting_progress,
-          input = input_inv and input_inv.get_contents() or {},
-          output = output_inv and output_inv.get_contents() or {},
-        }
+        input_contents = input_inv and input_inv.get_contents() or {}
+        output_contents = output_inv and output_inv.get_contents() or {}
       end
+      -- Fluids live in LuaFluidBox, a separate API from the item
+      -- inventories above (LuaInventory) — get_inventory() never sees
+      -- them, so a pure-fluid machine (e.g. a gas vent) always reported
+      -- empty input/output regardless of what was actually flowing
+      -- through it. entity.fluidbox is a valid, possibly zero-length,
+      -- LuaFluidBox on every entity type, so this needs no per-type
+      -- gate like CONTENTS_INVENTORY_BY_TYPE above.
+      local fluids = {}
+      for i = 1, #entity.fluidbox do
+        local fluid = entity.fluidbox[i]
+        if fluid then
+          fluids[#fluids + 1] = {
+            index = i,
+            name = fluid.name,
+            amount = fluid.amount,
+            temperature = fluid.temperature,
+          }
+        end
+      end
+      buildings_out[tostring(id)] = {
+        crafting_progress = entity.crafting_progress,
+        input = input_contents,
+        output = output_contents,
+        fluids = fluids,
+      }
     end
   end
   write_snapshot("building-contents", { tick = game.tick, buildings = buildings_out })

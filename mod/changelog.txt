@@ -1,4 +1,16 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.7
+Date: 2026-08-02
+  Bugfixes:
+    - building-contents.json's input/output fields only ever read item
+      inventories (LuaInventory), never fluidboxes (LuaFluidBox) -- a
+      tracked machine that only handles fluids (e.g. a gas vent) always
+      reported empty input/output no matter what was actually flowing
+      through it. Added a new fluids array (index/name/amount/temperature
+      per populated fluidbox slot), read unconditionally for every tracked
+      entity regardless of type, since fluidboxes aren't gated the same way
+      the item-inventory slot lookup is. See SCHEMA.md building-contents.json.
+---------------------------------------------------------------------------------------------------
 Version: 0.3.6
 Date: 2026-07-17
   Changes:

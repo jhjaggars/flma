@@ -480,7 +480,8 @@ later disabled rather than being truncated.
     "178050": {
       "crafting_progress": 0.42,
       "input": [{ "name": "iron-plate", "quality": "normal", "count": 5 }],
-      "output": [{ "name": "processing-unit", "quality": "normal", "count": 2 }]
+      "output": [{ "name": "processing-unit", "quality": "normal", "count": 2 }],
+      "fluids": [{ "index": 1, "name": "sulfuric-acid", "amount": 173.2, "temperature": 25 }]
     }
   }
 }
@@ -496,14 +497,23 @@ later disabled rather than being truncated.
   genuinely empty, since this file's `buildings` map is already scoped to
   exactly the entities the setting asked for — no absent-not-null
   collapsing here, unlike `buildings.ndjson`'s config fields.
-- Only covers `assembling-machine` and `furnace` types — `rocket-silo`
-  (also recipe-capable) has a materially different inventory layout and
-  isn't covered; a tracked rocket-silo is silently skipped rather than
-  erroring.
+- `input`/`output` only cover `assembling-machine` and `furnace` types —
+  `rocket-silo` (also recipe-capable) has a materially different inventory
+  layout and isn't covered; a tracked rocket-silo gets empty `input`/
+  `output` arrays rather than erroring.
 - Ingredient/output inventory slots differ by entity type under the hood
   (`defines.inventory.assembling_machine_input`/`_output` vs.
   `defines.inventory.furnace_source`/`_result`) but the exported shape is
   identical either way.
+- `fluids` — fluids live in a separate API (`LuaFluidBox`) from the item
+  inventories `input`/`output` read from (`LuaInventory`); a pure-fluid
+  machine (e.g. a gas vent) always has empty `input`/`output` regardless of
+  what's actually flowing through it — check `fluids` instead. Array of
+  `{"index", "name", "amount", "temperature"}`, one entry per populated
+  fluidbox slot (empty array if none); `index` is the 1-based fluidbox slot
+  number, useful when a machine has more than one (e.g. separate input/
+  output fluid boxes). Not gated by entity type — read for every tracked
+  entity, `rocket-silo` included.
 
 ## Console / RCON introspection
 

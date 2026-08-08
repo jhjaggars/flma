@@ -7,7 +7,7 @@ live-state reading layer in `src/`, the planner CLI in `planner/`,
 described here; consumers read them and nothing else — there is no other
 channel between the two.
 
-Describes the format as written by mod version **0.3.6** (`mod/info.json`).
+Describes the format as written by mod version **0.3.9** (`mod/info.json`).
 Shape changes are noted in `mod/changelog.txt`; additions of new fields or new
 files are backwards-compatible and consumers must ignore keys they don't
 recognize.
@@ -163,10 +163,16 @@ Per-force, per-surface item and fluid production statistics, engine-aggregated.
           "items": {
             "input_counts":  { "iron-plate": 5804438 },
             "output_counts": { "iron-plate": 4436164 },
-            "input_rates_per_min":  { "iron-plate": 1450.2 },
-            "output_rates_per_min": { "iron-plate": 1201.0 }
+            "input_rates_per_min":   { "iron-plate": 1450.2 },
+            "output_rates_per_min":  { "iron-plate": 1201.0 },
+            "input_rates_per_10min": { "iron-plate": 1402.8 },
+            "output_rates_per_10min":{ "iron-plate": 1250.4 },
+            "input_rates_per_hour":  { "iron-plate": 1380.5 },
+            "output_rates_per_hour": { "iron-plate": 1300.1 },
+            "input_rates_per_10hr":  { "iron-plate": 1200.0 },
+            "output_rates_per_10hr": { "iron-plate": 1100.9 }
           },
-          "fluids": { "...same four maps...": {} }
+          "fluids": { "...same ten maps...": {} }
         }
       }
     }
@@ -180,9 +186,21 @@ Two kinds of numbers — don't confuse them:
   force began, not rates. `input` = ever *produced*, `output` = ever
   *consumed* (matching the left/right split of the in-game production GUI —
   yes, the naming is inverted from what you'd guess; it's the engine's).
-- `input_rates_per_min` / `output_rates_per_min` — real per-minute flow over
-  roughly the last 60 seconds. Use these for anything rate-shaped
-  ("how much am I making right now").
+- `input_rates_per_<window>` / `output_rates_per_<window>` — real flow rates,
+  one pair per lookback window (`min`, `10min`, `hour`, `10hr` — one minute up
+  to ten hours, matching the windows the in-game production statistics GUI
+  itself offers, mod 0.3.8+). **Every window's numbers are still per-minute
+  units** — Factorio's `get_flow_count` always normalizes to per-minute
+  regardless of the precision requested — so a `10hr` figure means "the
+  per-minute rate, averaged over the last 10 hours," directly comparable to
+  the `min` figure, not a 10-hour total. Use `min` for "what's happening right
+  now"; use a longer window when you need to tell a genuine sustained
+  shortfall/surplus apart from a momentary blip — e.g. a machine that's
+  merely stalled behind a full output buffer or a blocked pipe reports a
+  reduced `min` rate identical to one that's actually under-supplied, but a
+  `10hr` average washes that kind of blip out. Mod builds before 0.3.8 only
+  wrote the `min` pair; a consumer should treat a missing longer-window key
+  as "older mod build," not as zero flow.
 
 A surface may omit `items` or `fluids` if the engine call failed for it.
 

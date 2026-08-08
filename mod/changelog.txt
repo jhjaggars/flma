@@ -1,4 +1,37 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.3.9
+Date: 2026-08-08
+  Bugfixes:
+    - buildings.ndjson was recording every placed ghost (belts, pipes,
+      poles, inserters, and other types query_buildings deliberately
+      excludes), not just real buildings. A ghost's own entity.type is
+      always "entity-ghost"/"tile-ghost" regardless of what it previews, so
+      the type-based blocklist that's supposed to filter connective-tissue
+      entities out of on_built_entity/on_robot_built_entity never matched
+      ghosts, letting all of them through -- large blueprint placements
+      could burst thousands of spurious log lines and index entries. Added
+      entity-ghost/tile-ghost to the blocklist so ghost placement is no
+      longer treated as a build; a ghost still gets recorded once
+      construction actually completes and fires its own build event with
+      the real entity.
+---------------------------------------------------------------------------------------------------
+Version: 0.3.8
+Date: 2026-08-02
+  Changes:
+    - production.json's per-item/fluid flow rates were hardcoded to a single
+      one-minute window (get_flow_count with precision_index=one_minute), so
+      a machine merely stalled behind a full output buffer or a blocked pipe
+      reported the same reduced rate as one that's genuinely under-supplied
+      -- no way to tell a real sustained shortfall from a momentary blip.
+      Now also exports the same rates averaged over ten_minutes, one_hour,
+      and ten_hours (input_rates_per_10min/_hour/_10hr and their output_
+      counterparts, alongside the existing _per_min pair, unchanged) -- the
+      same windows the in-game production statistics GUI itself offers.
+      Every window's numbers stay per-minute units (get_flow_count always
+      normalizes that way), just averaged over a longer or shorter lookback.
+      Purely additive: existing consumers reading only the _per_min fields
+      are unaffected. See SCHEMA.md production.json.
+---------------------------------------------------------------------------------------------------
 Version: 0.3.7
 Date: 2026-08-02
   Bugfixes:

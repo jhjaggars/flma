@@ -80,8 +80,18 @@ end
 -- This is a blocklist by Factorio's built-in prototype `type`, not by name —
 -- every mod's custom entities (including all of pyanodons') still have to
 -- declare one of these fixed engine type categories, so this generalizes to
--- any mod without per-mod maintenance. Two groups:
+-- any mod without per-mod maintenance. Three groups:
 local BUILDING_TYPE_BLOCKLIST = {
+  -- not yet real: a ghost's own entity.type is always "entity-ghost"/
+  -- "tile-ghost" regardless of what it previews (the real prototype is only
+  -- reachable via entity.ghost_type/ghost_name, which nothing here reads) —
+  -- so without these, every type clause below is blind to ghosts and a big
+  -- blueprint's worth of belt/pipe/pole ghosts all pass the filter straight
+  -- through to on_build_event. A ghost becoming real still fires its own
+  -- on_robot_built_entity/script_raised_revive with the real type once
+  -- construction completes, so nothing is lost by excluding the preview.
+  ["entity-ghost"] = true,
+  ["tile-ghost"] = true,
   -- not player-placed at all
   ["resource"] = true,
   ["tree"] = true,
@@ -368,46 +378,63 @@ end
 
 -- input_counts/output_counts are LIFETIME CUMULATIVE totals since the
 -- force/game began (matching the "Total" figures in the in-game production
--- statistics GUI) — NOT rates. To also get a real per-minute rate, this calls
--- LuaFlowStatistics::get_flow_count per item/fluid name with
--- precision_index=one_minute and count=false: per the API docs, that returns
--- "the average across the provided precision time period" and "all return
--- values are normalized to be per-minute for all [non-electric] types" — so
--- the number really is "flow over roughly the last 60s", already in the units
--- we want. Still O(#item types): one extra call per name already present in
--- input_counts/output_counts, not a new scan.
+-- statistics GUI) — NOT rates. To also get real flow rates, this calls
+-- LuaFlowStatistics::get_flow_count per item/fluid name, once per window in
+-- FLOW_WINDOWS below (count=false): per the API docs, that returns "the
+-- average across the provided precision time period" and "all return values
+-- are normalized to be per-minute for all [non-electric] types" — so every
+-- window's number is still a per-minute rate, just averaged over a longer or
+-- shorter lookback. A single one-minute window can't tell a genuine capacity
+-- shortfall apart from a machine that's merely stalled behind a full output
+-- buffer or a blocked pipe right now — both report the same reduced
+-- 1-minute flow. Exporting several windows side by side (1 minute up to 10
+-- hours) lets a consumer see whether a shortfall is a real sustained trend
+-- or just a momentary blip. Still O(#item types): one extra get_flow_count
+-- call per name per window per direction (4 windows x 2 directions = 8 calls
+-- per name), not a new scan.
+local FLOW_WINDOWS = {
+  { suffix = "min", precision_index = defines.flow_precision_index.one_minute },
+  { suffix = "10min", precision_index = defines.flow_precision_index.ten_minutes },
+  { suffix = "hour", precision_index = defines.flow_precision_index.one_hour },
+  { suffix = "10hr", precision_index = defines.flow_precision_index.ten_hours },
+}
+
 local function flow_to_table(flow_stats)
   if not flow_stats then
     return nil
   end
-  local input_rates = {}
-  for name, _ in pairs(flow_stats.input_counts or {}) do
-    input_rates[name] = flow_stats.get_flow_count({
-      name = name,
-      category = "input",
-      precision_index = defines.flow_precision_index.one_minute,
-      count = false,
-    })
-  end
-  local output_rates = {}
-  for name, _ in pairs(flow_stats.output_counts or {}) do
-    output_rates[name] = flow_stats.get_flow_count({
-      name = name,
-      category = "output",
-      precision_index = defines.flow_precision_index.one_minute,
-      count = false,
-    })
-  end
-  return {
+  local out = {
     -- lifetime cumulative totals (unchanged, still useful for "how much have
     -- I ever made")
     input_counts = flow_stats.input_counts,
     output_counts = flow_stats.output_counts,
-    -- real per-minute flow rates (the last ~60s), for "how much am I making
-    -- right now"
-    input_rates_per_min = input_rates,
-    output_rates_per_min = output_rates,
   }
+  for _, window in ipairs(FLOW_WINDOWS) do
+    local input_rates = {}
+    for name, _ in pairs(flow_stats.input_counts or {}) do
+      input_rates[name] = flow_stats.get_flow_count({
+        name = name,
+        category = "input",
+        precision_index = window.precision_index,
+        count = false,
+      })
+    end
+    local output_rates = {}
+    for name, _ in pairs(flow_stats.output_counts or {}) do
+      output_rates[name] = flow_stats.get_flow_count({
+        name = name,
+        category = "output",
+        precision_index = window.precision_index,
+        count = false,
+      })
+    end
+    -- e.g. input_rates_per_min/output_rates_per_min (unchanged from before)
+    -- plus input_rates_per_10min, ..._hour, ..._10hr — same per-minute
+    -- units throughout, just averaged over a longer lookback
+    out["input_rates_per_" .. window.suffix] = input_rates
+    out["output_rates_per_" .. window.suffix] = output_rates
+  end
+  return out
 end
 
 local function export_production_stats()
